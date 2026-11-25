@@ -1580,6 +1580,245 @@ function updateRefFields(doc, mode) {
   return updated;
 }
 
+/* ------------------------------------------------------------
+ * 旧编号引用替换（通用函数）
+ * 用途：全文/本章重编号完成后，把正文里指向旧编号的引用替换成新编号。
+ *       宏版和加载项版共用，支持本章/全文范围。
+ * ------------------------------------------------------------ */
+
+// 读完整个文档，收集所有 EQNUM_NUM_ 书签的当前文本
+function readAllBookmarkTexts(doc) {
+  var m = {};
+  var items = listOurBookmarks(doc);
+  for (var i = 0; i < items.length; i++) {
+    var txt = (items[i].text || "").replace(/^\s+|\s+$/g, "");
+    if (txt) m[items[i].name] = txt;
+  }
+  return m;
+}
+
+// 从 renumberAll 的 list 构建 { 旧编号文本: 新编号文本 } 映射
+// 必须在所有域更新完之后调用（新编号是 SEQ/STYLEREF 结果）
+function collectOldNewMap(list, bmTexts) {
+  var map = {};
+  for (var i = 0; i < list.length; i++) {
+    var f = list[i];
+    var oldTxt = (f.trailing || "").replace(/^\s+|\s+$/g, "");
+    if (!oldTxt) continue;
+    var newTxt = bmTexts[f.bookmarkName] || "";
+    if (!newTxt) continue;
+    if (oldTxt === newTxt) continue;
+    if (map[oldTxt] && map[oldTxt] !== newTxt) {
+      log("WARN", "同一旧编号 " + oldTxt + " 被映射到多个新编号（" +
+        map[oldTxt] + " 与 " + newTxt + "），仅保留首次");
+      continue;
+    }
+    map[oldTxt] = newTxt;
+  }
+  return map;
+}
+
+// 通用：在 doc 上做安全的正文引用替换。
+// mapping: { "(1.1)": "(2.1)", ... }  旧→新编号文本对
+// opts:
+//   prefix      正文引用的前缀，默认 CFG.refPrefix || "式"
+//   bareParen   是否额外替换裸 "(旧)" → "(新)" 模式（默认 false，较危险）
+//   scope       "full" | "chapter" （默认 "full"；chapter 需 opts.chapterStart/End）
+//   chapterStart/chapterEnd  scope="chapter" 时的段号范围（可选）
+//   progressCb  function(done, total, text)  进度回调（加载项环境用）
+// 返回 { replaced: number, pairs: number, usedMs: number }
+function scanAndReplaceOldRefs(doc, mapping, opts) {
+  opts = opts || {};
+  var prefix = opts.prefix || CFG.refPrefix || "式";
+  var bareParen = !!opts.bareParen;
+  var scope = opts.scope || "full";
+  var progressCb = opts.progressCb;
+
+  var pairs = Object.keys(mapping);
+  if (pairs.length === 0) return { replaced: 0, pairs: 0, usedMs: 0 };
+
+  // 按旧编号文本长度倒序：避免短编号误替换长编号的前缀
+  // 例：若 (1) 和 (1.1) 都在映射里，先换 (1.1) 才能防止 (1) 把 (1.1) 先拆坏
+  pairs.sort(function (a, b) { return b.length - a.length; });
+
+  log("INFO", "=== 开始正文引用替换（" + pairs.length + " 对） ===");
+  var tAll = Date.now();
+  var totalOps = pairs.length * (bareParen ? 2 : 1);
+  var done = 0;
+  var replaced = 0;
+
+  // 构造 Find 作用范围：全文 Content 或章段范围
+  var searchRange = null;
+  try {
+    if (scope === "chapter" && opts.chapterStart > 0 && opts.chapterEnd > 0) {
+      var rStart = Number(doc.Paragraphs.Item(opts.chapterStart).Range.Start);
+      var rEnd = Number(doc.Paragraphs.Item(opts.chapterEnd).Range.End);
+      searchRange = doc.Range(rStart, rEnd);
+      log("INFO", "替换范围：章段 " + opts.chapterStart + " ~ " + opts.chapterEnd);
+    } else {
+      searchRange = doc.Content;
+      log("INFO", "替换范围：全文");
+    }
+  } catch (eRange) {
+    log("WARN", "构造搜索范围失败，回退到全文：" + errText(eRange));
+    searchRange = doc.Content;
+  }
+
+  // 关屏幕更新（减少重排开销）
+  var oldScreen = null;
+  try { var sv = Application.ScreenUpdating; if (sv !== undefined && sv !== null) oldScreen = !!sv; } catch (eS0) {}
+  try { Application.ScreenUpdating = false; } catch (eS1) {}
+
+  var findObj = null;
+  try { findObj = searchRange.Find; } catch (eF0) {}
+  if (!findObj) {
+    log("FAIL", "无法获取 Find 对象，引用替换中止");
+    try { Application.ScreenUpdating = oldScreen; } catch (eS2) {}
+    return { replaced: 0, pairs: pairs.length, usedMs: 0 };
+  }
+
+  try {
+    for (var i = 0; i < pairs.length; i++) {
+      var oldNum = pairs[i];
+      var newNum = mapping[oldNum];
+
+      // 模式 1：前缀 + 编号（安全）
+      try {
+        findObj.ClearFormatting();
+        findObj.Replacement.ClearFormatting();
+      } catch (eClr) {}
+
+      try {
+        findObj.Text = prefix + oldNum;
+        findObj.Replacement.Text = prefix + newNum;
+        findObj.Forward = true;
+        findObj.Wrap = 0; // wdFindStop
+        findObj.MatchCase = false;
+        findObj.MatchWholeWord = false;
+        findObj.MatchWildcards = false;
+        findObj.MatchSoundsLike = false;
+        findObj.MatchAllWordForms = false;
+
+        // 用 Execute 而非 ExecuteOld（WPS 兼容）
+        var r1 = null;
+        try {
+          r1 = findObj.Execute({
+            FindText: prefix + oldNum,
+            ReplaceWith: prefix + newNum,
+            Forward: true,
+            Wrap: 0,
+            Replace: 2 // wdReplaceAll
+          });
+        } catch (eEx1) {
+          // 15 参数老式
+          try { findObj.Execute(prefix + oldNum, false, false, false, false, false, true, 0, false, prefix + newNum, 2); }
+          catch (eEx1b) {}
+        }
+
+        // 至少 Execute 过一次就算走过流程；WPS 不返回替换计数
+        done++;
+        log("INFO", "引用替换 [" + (i + 1) + "/" + pairs.length + "] " +
+          prefix + oldNum + " → " + prefix + newNum + "（前缀模式）");
+      } catch (ePat1) {
+        log("WARN", "前缀模式替换失败 " + prefix + oldNum + "：" + errText(ePat1));
+        done++;
+      }
+
+      if (bareParen) {
+        try {
+          findObj.ClearFormatting();
+          findObj.Replacement.ClearFormatting();
+        } catch (eClr2) {}
+        try {
+          // 裸括号模式：前后是非字母数字非括号字符或文档边界
+          // Word 的 Find 不支持 lookbehind，改用通配符 + 捕获组
+          // 模式：([!A-Za-z0-9\(\)（）]) + oldNum → \1 + newNum
+          findObj.MatchWildcards = true;
+          findObj.Text = "([!A-Za-z0-9\\(\\)（）])" + escapeForWildcard(oldNum);
+          findObj.Replacement.Text = "\\1" + escapeReplaceBackslash(newNum);
+          findObj.Forward = true;
+          findObj.Wrap = 0;
+
+          try {
+            findObj.Execute({
+              FindText: "([!A-Za-z0-9\\(\\)（）])" + escapeForWildcard(oldNum),
+              ReplaceWith: "\\1" + escapeReplaceBackslash(newNum),
+              Forward: true,
+              Wrap: 0,
+              Replace: 2,
+              MatchWildcards: true
+            });
+          } catch (eEx2) {
+            try { findObj.Execute("([!A-Za-z0-9\\(\\)（）])" + escapeForWildcard(oldNum),
+              false, false, false, false, false, true, 0, false,
+              "\\1" + escapeReplaceBackslash(newNum), 2, true); }
+            catch (eEx2b) {}
+          }
+          log("INFO", "引用替换 [" + (i + 1) + "/" + pairs.length + "] 裸括号 " + oldNum + " → " + newNum);
+        } catch (ePat2) {
+          log("WARN", "裸括号模式替换失败 " + oldNum + "：" + errText(ePat2));
+        }
+        done++;
+      }
+
+      if (progressCb) {
+        try { progressCb(done, totalOps,
+          "替换引用 " + (i + 1) + "/" + pairs.length + "：" + oldNum + " → " + newNum); }
+        catch (eP) {}
+      }
+    }
+  } finally {
+    try { Application.ScreenUpdating = oldScreen; } catch (eS3) {}
+  }
+
+  // 替换完必须刷所有域：SEQ 计数器、REF 引用、STYLEREF
+  log("INFO", "引用替换完成，用时 " + (Date.now() - tAll) + "ms，开始刷全部域");
+  var tUp = Date.now();
+  var tr = run(function () { doc.Fields.Update(); return 0; });
+  if (!tr.ok) log("WARN", "全局域更新失败：" + errText(tr.error));
+  log("INFO", "全局域更新用时 " + (Date.now() - tUp) + "ms");
+
+  var used = Date.now() - tAll;
+  log("INFO", "=== 正文引用替换结束：共 " + pairs.length + " 对，用时 " + used + "ms ===");
+  return { replaced: replaced, pairs: pairs.length, usedMs: used };
+}
+
+function escapeForWildcard(s) {
+  // Word 通配符里要转的：\ [ ] { } < > ( ) @ * ? -
+  return String(s).replace(/([\\\[\]{}<>()@*?\-])/g, "\\$1");
+}
+function escapeReplaceBackslash(s) {
+  // 替换字符串里的 \ 和 $ 要转成 \\ 和 \$
+  return String(s).replace(/\\/g, "\\\\").replace(/\$/g, "\\$");
+}
+
+// 三选一对话框，返回："update" / "skip" / "cancel"
+function askRefReplaceOption(mapping) {
+  if (!mapping || Object.keys(mapping).length === 0) return "skip";
+
+  var pairs = Object.keys(mapping);
+  var msg = "检测到 " + pairs.length + " 个旧编号已变化：\r";
+  var previewMax = Math.min(pairs.length, 8);
+  for (var i = 0; i < previewMax; i++) {
+    msg += pairs[i] + " → " + mapping[pairs[i]] + "\r";
+  }
+  if (pairs.length > previewMax) msg += "……（共 " + pairs.length + " 对）\r";
+
+  msg += "\r";
+  msg += "是否将正文中的旧编号引用一并替换？\r";
+  msg += "  1. 更新旧编号的引用（推荐；较慢，但正文完整）\r";
+  msg += "  2. 忽略旧编号的引用（更快；正文引用需手动更新）\r";
+  msg += "  C / 取消（放弃本次重编号）\r\r";
+  msg += "请输入选项 [1/2/C]";
+
+  var ans = InputBox(msg, "EQNUM 引用更新", "1");
+  if (ans === null || ans === undefined) return "cancel";
+  var a = String(ans).replace(/\s/g, "").toLowerCase();
+  if (a === "1" || a === "") return "update";
+  if (a === "2") return "skip";
+  return "cancel";
+}
+
 function listOurBookmarks(doc) {
   var items = [];
   try {
@@ -1938,6 +2177,34 @@ async function renumberAll(doc, collected, options) {
     log("INFO", "=== 开始更新引用域 ===");
     var refs = updateRefFields(doc, CFG.refreshRefs);
 
+    // —— 旧编号引用替换（通用挂接）——
+    // 只在有成功完成的编号、且捕获到旧 trailing 编号时触发
+    var oldNewMap = null;
+    if (done > 0) {
+      var bmTexts = readAllBookmarkTexts(doc);
+      oldNewMap = collectOldNewMap(list, bmTexts);
+      log("INFO", "旧编号→新编号映射：" + Object.keys(oldNewMap).length + " 对");
+    }
+
+    if (oldNewMap && Object.keys(oldNewMap).length > 0) {
+      reportProgress(list.length, list.length, "询问是否替换正文引用");
+      var choice = askRefReplaceOption(oldNewMap);
+      if (choice === "update") {
+        reportProgress(list.length, list.length, "替换正文引用");
+        var replaceResult = scanAndReplaceOldRefs(doc, oldNewMap, {
+          scope: options.scopeChapter ? "chapter" : "full",
+          chapterStart: options.chapterStart || 0,
+          chapterEnd: options.chapterEnd || 0,
+          progressCb: reportProgress
+        });
+        log("INFO", "正文引用替换完成：共 " + replaceResult.pairs + " 对，用时 " + replaceResult.usedMs + "ms");
+      } else if (choice === "skip") {
+        log("INFO", "用户选择忽略正文引用替换");
+      } else {
+        log("WARN", "用户选择取消（重编号已生效，引用替换未执行；如需回退请 Ctrl+Z）");
+      }
+    }
+
     log("INFO", "=== 全文重编号结束：成功 " + done + "，失败 " + failed +
       "，引用 " + refs + "，总用时 " + (Date.now() - tAll) + "ms ===");
     reportProgress(list.length, list.length,
@@ -2143,7 +2410,9 @@ async function runRefresh(doc) {
     log("INFO", "第 " + curChapter + " 章候选 " + nChap + " 个，开始重编号（含未编号公式）");
     var resScan = await renumberAll(doc, scanned, {
       skipConfirm: true,
-      scopeChapter: curChapter
+      scopeChapter: curChapter,
+      chapterStart: bounds.start,
+      chapterEnd: bounds.end
     });
     if (resScan.cancelled) return;
 
@@ -2165,6 +2434,9 @@ async function runRefresh(doc) {
   var options = { skipConfirm: true };
   if (scope === "chapter") {
     options.scopeChapter = curChapter;
+    var bounds2 = chapterBounds(doc, curPara);
+    options.chapterStart = bounds2.start;
+    options.chapterEnd = bounds2.end;
   }
 
   collected.confirmed = true;
@@ -2253,11 +2525,13 @@ function runCurrent(doc) {
 
   // 删除公式后面已有的旧编号（同段或后续段落，不跨分页/分节符）
   var paraIndex = -1;
+  var oldTrailText = "";
   try { paraIndex = Number(doc.Range(0, p.Range.Start).Paragraphs.Count) + 1; } catch (eIdx) {}
 
   if (paraIndex > 0) {
     var trail = findTrailingNumber(doc, p, target, paraIndex);
     if (trail.found && trail.range) {
+      oldTrailText = (trail.text || "").replace(/^\s+|\s+$/g, "");
       removeOldNumber(doc, trail, "当前");
       try { p = target.Range.Paragraphs.Item(1); } catch (eRe) {}
     }
@@ -2316,6 +2590,23 @@ function runCurrent(doc) {
   try { shown = String(table.Cell(1, 2).Range.Text).replace(/[\r\u0007]/g, ""); } catch (eShow) {}
 
   log("INFO", "当前公式已编号：" + shown + "，书签：" + name);
+
+  // —— 单公式：若删掉了旧 trailing 编号，可能存在正文引用需要同步 ——
+  if (oldTrailText && oldTrailText !== shown) {
+    var singleMap = {};
+    singleMap[oldTrailText] = shown;
+    // 让 SEQ/STYLEREF 计数器更新到最新位置
+    updateOurSeqFields(doc);
+
+    var choice = askRefReplaceOption(singleMap);
+    if (choice === "update") {
+      scanAndReplaceOldRefs(doc, singleMap, { scope: "full" });
+    } else if (choice === "skip") {
+      log("INFO", "单公式：用户选择忽略正文引用替换");
+    } else {
+      log("WARN", "单公式：用户取消（编号已生效，引用替换未执行）");
+    }
+  }
 }
 
 function findControlInCollection(controls, depth) {
@@ -2473,7 +2764,7 @@ async function main() {
   // 加载项页面也会加载本文件，此时没有宏入口传入的 mode，直接返回
   if (typeof mode === "undefined" || !mode) return;
 
-  log("INFO", "EQNUM 版本：2026-11-24-v11（删除旧编号不再合并；制表符插段尾，表格外包公式）");
+  log("INFO", "EQNUM 版本：2026-11-25-v12（正文引用替换：检测到旧编号变化后三选一对话框；通用 scanAndReplaceOldRefs 支持 prefix/裸括号/章范围）");
 
   if (mode === "settings") {
     var d0 = ensureDocument();
