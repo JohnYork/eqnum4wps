@@ -1,0 +1,25 @@
+# WPS 临时文件
+*.docm~
+*.docx~
+*.doc~
+*.xlsm~
+*.pptm~
+*.~*
+.lock
+
+# 编辑器 / IDE
+.vscode/
+.trae/
+.trae-cn/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 生成/分享产物
+.trae-html-share-packages/
+
+# WPS 用户级安装目录（不要提交）
+# ~/.local/share/Kingsoft/wps/jsaddons/eqnum_*

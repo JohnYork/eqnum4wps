@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>公式编号</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 10px 12px 14px;
+      font: 13px/1.5 "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+      color: #222;
+      background: #fff;
+    }
+    .hd { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 8px; }
+    .hd .title { font-size: 15px; font-weight: 600; }
+    .hd .ver { font-size: 11px; color: #999; }
+    .doc { font-size: 12px; color: #555; margin-bottom: 10px; word-break: break-all; }
+
+    .sec { border: 1px solid #e4e4e4; border-radius: 4px; padding: 8px 10px 10px; margin-bottom: 10px; }
+    .sec-title { font-weight: 600; margin-bottom: 8px; color: #333; }
+
+    /* ---------- 抽屉（可折叠设置） ---------- */
+    .drawer { border: 1px solid #e4e4e4; border-radius: 4px; margin-bottom: 10px; overflow: hidden; }
+    .drawer-toggle {
+      display: flex; align-items: center; justify-content: space-between;
+      width: 100%; height: 30px; padding: 0 10px;
+      border: none; background: #f3f5f8; color: #333;
+      font-size: 13px; font-weight: 600; cursor: pointer;
+      border-bottom: 1px solid #e4e4e4;
+    }
+    .drawer-toggle:hover { background: #e8edf5; }
+    .drawer-toggle .arrow {
+      display: inline-block; width: 10px; height: 10px;
+      border-right: 1.5px solid #555; border-bottom: 1.5px solid #555;
+      transform: rotate(45deg); transition: transform .18s ease;
+    }
+    .drawer.collapsed .drawer-toggle .arrow { transform: rotate(-45deg); margin-top: 2px; }
+    .drawer-body { padding: 10px; background: #fff; }
+    .drawer.collapsed .drawer-body { display: none; }
+
+    .row { display: flex; align-items: center; margin-bottom: 6px; }
+    .row label { width: 76px; color: #555; flex: none; }
+    .row select, .row input[type=text], .row input[type=number] {
+      flex: 1; height: 26px; padding: 0 6px; border: 1px solid #ccc; border-radius: 3px;
+      font-size: 12px; background: #fff; color: #222;
+    }
+
+    /* ---------- 竖排等宽按钮 ---------- */
+    .btnstack { display: flex; flex-direction: column; gap: 6px; }
+    .btnstack button {
+      width: 100%; height: 32px; padding: 0 10px;
+      border: 1px solid #c8c8c8; border-radius: 3px;
+      background: #f7f7f7; color: #222; font-size: 13px; cursor: pointer;
+      text-align: left;
+    }
+    .btnstack button:hover { background: #eef4ff; border-color: #8ab4f8; }
+    .btnstack button.primary { background: #2b6cff; border-color: #2b6cff; color: #fff; }
+    .btnstack button.primary:hover { background: #1e5be0; }
+    .btnstack button.danger { background: #fff; border-color: #d6d6d6; color: #c0392b; }
+    .btnstack button.danger:hover { background: #fdecea; border-color: #e57373; }
+    .btnstack button:disabled { opacity: .5; cursor: default; }
+
+    .btnrow { display: flex; gap: 6px; margin-top: 8px; }
+    .btnrow button {
+      flex: 1; height: 28px; padding: 0 8px;
+      border: 1px solid #c8c8c8; border-radius: 3px;
+      background: #f7f7f7; color: #222; font-size: 12px; cursor: pointer;
+    }
+    .btnrow button:hover { background: #eef4ff; border-color: #8ab4f8; }
+    .btnrow button.primary { background: #2b6cff; border-color: #2b6cff; color: #fff; }
+    .btnrow button:disabled { opacity: .5; cursor: default; }
+
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+    .stat { background: #f7f8fa; border-radius: 3px; padding: 6px 8px; }
+    .stat .k { font-size: 11px; color: #888; }
+    .stat .v { font-size: 14px; font-weight: 600; }
+
+    .logbox { display: flex; flex-direction: column; }
+    .loghd { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+    .loghd .state { font-size: 12px; color: #888; }
+    .loghd .state.busy { color: #2b6cff; }
+
+    pre#logArea {
+      margin: 0; height: 220px; overflow: auto; padding: 6px 8px;
+      background: #101418; color: #d6dde6; border-radius: 3px;
+      font: 11px/1.45 "JetBrains Mono", Consolas, monospace;
+      white-space: pre-wrap; word-break: break-all;
+    }
+    pre#logArea .warn { color: #ffd479; }
+    pre#logArea .err { color: #ff8a8a; }
+    pre#logArea .alert { color: #7fd7ff; }
+    pre#logArea .info { color: #9ee493; }
+
+    .chk { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #555; margin-top: 6px; }
+    .hint { font-size: 11px; color: #a26a00; background: #fff8e6; border: 1px solid #f0e0b8;
+            border-radius: 3px; padding: 4px 6px; margin-top: 6px; }
+
+    .bar { height: 8px; background: #eef1f6; border-radius: 4px; overflow: hidden; margin-top: 10px; }
+    .bar-in { height: 100%; width: 0; background: #2b6cff; transition: width .18s linear; }
+    .bar-in.done { background: #34a853; }
+    .progtext { font-size: 11px; color: #666; margin-top: 6px; min-height: 15px; word-break: break-all; }
+
+    .gaprow { margin-top: 8px; }
+    .gaprow .row label { width: 76px; color: #555; flex: none; }
+  </style>
+</head>
+<body>
+  <div class="hd">
+    <div class="title">公式编号</div>
+    <div class="ver" id="verText">-</div>
+  </div>
+  <div class="doc" id="docText">正在读取文档…</div>
+
+  <!-- ========== 设置抽屉（默认折叠） ========== -->
+  <div class="drawer collapsed" id="drawerSettings">
+    <button class="drawer-toggle" id="toggleSettings" type="button">
+      <span>编号设置</span>
+      <span class="arrow" aria-hidden="true"></span>
+    </button>
+    <div class="drawer-body">
+      <div class="row">
+        <label>编号模式</label>
+        <select id="selMode">
+          <option value="chapter">按章编号 (2.1)</option>
+          <option value="continuous">全文连续 (1)</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>章层级</label>
+        <select id="selLevel">
+          <option value="1">标题 1</option>
+          <option value="2">标题 2</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>起始值</label>
+        <input type="number" id="inpStart" min="1" step="1" value="1">
+      </div>
+      <div class="row">
+        <label>引用前缀</label>
+        <input type="text" id="inpRefPrefix" value="式">
+      </div>
+      <div class="row">
+        <label>刷新引用</label>
+        <select id="selRefreshRefs">
+          <option value="ours">仅本工具</option>
+          <option value="all">全部引用域</option>
+          <option value="none">不刷新</option>
+        </select>
+      </div>
+      <div class="btnrow">
+        <button id="btnSave" class="primary">保存</button>
+        <button id="btnReload">重新读取</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== 运行区 ========== -->
+  <div class="sec">
+    <div class="sec-title">运行</div>
+    <div class="btnstack">
+      <button id="btnCurrent">编号当前公式</button>
+      <button id="btnChapter" class="primary">本章重编号</button>
+      <button id="btnRenumber">全文重编号</button>
+      <button id="btnInsertRef">插入引用</button>
+      <button id="btnUpdateRefs">刷新引用</button>
+    </div>
+
+    <div class="progtext" id="progText">空闲</div>
+    <div class="bar"><div class="bar-in" id="progBar"></div></div>
+
+    <div class="btnrow">
+      <button id="btnCancel" class="danger" disabled>中止</button>
+    </div>
+
+    <div class="gaprow">
+      <div class="row">
+        <label>界面响应</label>
+        <select id="selGap">
+          <option value="0">不等待（最快）</option>
+          <option value="50">50 ms（推荐）</option>
+          <option value="100">100 ms</option>
+          <option value="200">200 ms（最流畅）</option>
+        </select>
+      </div>
+      <label class="chk"><input type="checkbox" id="chkAutoConfirm" checked> 执行前不再弹确认框</label>
+    </div>
+  </div>
+
+  <!-- ========== 文档统计（抽屉，默认折叠） ========== -->
+  <div class="drawer collapsed" id="drawerStats">
+    <button class="drawer-toggle" id="toggleStats" type="button">
+      <span>文档统计</span>
+      <span class="arrow" aria-hidden="true"></span>
+    </button>
+    <div class="drawer-body">
+      <div class="stats">
+        <div class="stat"><div class="k">段落</div><div class="v" id="stPara">-</div></div>
+        <div class="stat"><div class="k">公式</div><div class="v" id="stOm">-</div></div>
+        <div class="stat"><div class="k">域</div><div class="v" id="stField">-</div></div>
+        <div class="stat"><div class="k">书签</div><div class="v" id="stBm">-</div></div>
+        <div class="stat"><div class="k">表格</div><div class="v" id="stTable">-</div></div>
+        <div class="stat"><div class="k">自定义属性</div><div class="v" id="stProp">-</div></div>
+        <div class="stat"><div class="k">本工具编号</div><div class="v" id="stOurs">-</div></div>
+      </div>
+      <div class="btnrow">
+        <button id="btnStats">刷新统计</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== 日志（抽屉，默认折叠） ========== -->
+  <div class="drawer collapsed logbox" id="drawerLog">
+    <button class="drawer-toggle" id="toggleLog" type="button">
+      <span>日志 <span class="state" id="stateText">空闲</span></span>
+      <span class="arrow" aria-hidden="true"></span>
+    </button>
+    <div class="drawer-body">
+      <pre id="logArea"></pre>
+      <div class="btnrow">
+        <button id="btnClearLog">清空日志</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="../js/shim.js"></script>
+  <script src="../js/wps-eqnum.js"></script>
+  <script src="../js/panel.js"></script>
+</body>
+</html>
