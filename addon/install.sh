@@ -17,10 +17,11 @@ cp "$ROOT/index.html" "$TARGET/"
 cp "$ROOT/ribbon.xml" "$TARGET/"
 cp "$ROOT/main.js" "$TARGET/"
 
-rm -rf "$TARGET/js" "$TARGET/ui"
-mkdir -p "$TARGET/js" "$TARGET/ui"
+rm -rf "$TARGET/js" "$TARGET/ui" "$TARGET/images"
+mkdir -p "$TARGET/js" "$TARGET/ui" "$TARGET/images"
 cp "$ROOT/js/"*.js "$TARGET/js/"
 cp "$ROOT/ui/"* "$TARGET/ui/"
+cp "$ROOT/images/"* "$TARGET/images/"
 
 # 核心逻辑直接复用宏版脚本，避免两份实现分叉
 cp "$ROOT/../src/wps-eqnum.js" "$TARGET/js/wps-eqnum.js"

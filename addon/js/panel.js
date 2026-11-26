@@ -367,14 +367,6 @@ function bind() {
     appendLog({ text: "已请求中止：当前公式处理完后停止", level: "warn" });
   };
 
-  $("chkAutoConfirm").onchange = function () {
-    window.__EQNUM_AUTO_CONFIRM = !!$("chkAutoConfirm").checked;
-    appendLog({
-      text: "执行前确认框：" + (window.__EQNUM_AUTO_CONFIRM ? "已关闭" : "已开启"),
-      level: "info"
-    });
-  };
-
   $("selGap").onchange = function () {
     var gap = Number($("selGap").value);
     window.EQNUM_UI_GAP = gap;
@@ -414,7 +406,6 @@ function init() {
 
   bind();
   initGapSetting();
-  window.__EQNUM_AUTO_CONFIRM = !!$("chkAutoConfirm").checked;
 
   refreshDocInfo();
   loadSettings();

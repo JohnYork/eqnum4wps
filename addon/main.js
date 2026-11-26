@@ -34,6 +34,19 @@ function OnAddinLoad(ribbonUI) {
 function OnGetEnabled(control) { return true; }
 function OnGetVisible(control) { return true; }
 
+// 功能区按钮图标。WPS 只认 getImage 回调，不认 ribbon.xml 的 image 属性。
+// 返回相对路径时，根路径是加载项根目录。
+function GetImage(control) {
+  var id = "";
+  try { id = String(control.Id); } catch (e) {}
+  var file = "";
+  if (id === "btnCurrent") file = "images/eqnum-current.png";
+  else if (id === "btnInsertRef") file = "images/eqnum-insert-ref.png";
+  if (!file) return "";
+  try { console.log("[EQNUM] GetImage " + id + " -> " + file); } catch (e2) {}
+  return file;
+}
+
 function eqnumApp() { return window.Application; }
 
 function eqnumErr(e) {

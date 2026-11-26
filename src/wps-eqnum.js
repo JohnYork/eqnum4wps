@@ -7,7 +7,6 @@
  *   EQNUM_REFRESH()     刷新已编号公式（当前章节 / 全文）
  *   EQNUM_SETTINGS()    查看/修改设置
  *   EQNUM_INSERT_REF()  打开交叉引用对话框（失败回退输入框）
- *   EQNUM_DEBUG_SCAN()  只读诊断：打印前 20 个候选公式及旧编号位置
  *
  * 编号实现：
  *   - 右单元格题注字段：按章 ( STYLEREF <层级> \n . SEQ 公式 \s <层级> )
@@ -31,7 +30,6 @@ function EQNUM_REFRESH() { return EQNUM_MAIN("refresh"); }
 function EQNUM_SETTINGS() { return EQNUM_MAIN("settings"); }
 function EQNUM_INSERT_REF() { return EQNUM_MAIN("insertref"); }
 function EQNUM_UPDATE_REFS() { return EQNUM_MAIN("updaterefs"); }
-function EQNUM_DEBUG_SCAN() { return EQNUM_MAIN("debugscan"); }
 
 function EQNUM_MAIN(mode) {
 var PROGRESS_STEP = 500;
@@ -1023,6 +1021,19 @@ function collectFormulas(doc, options) {
     }
 
     var mixed = formulaMixed(doc, p, om, trail);
+
+    // 删号前先记下旧编号上的原生书签（通常是 _RefXXXX），
+    // 删掉编号后这些书签会消失，正文里的 REF 域需要改指到新书签
+    var oldRefBms = [];
+    try {
+      var trs = Number(trail.range.Start);
+      var tre = Number(trail.range.End);
+      oldRefBms = bookmarksInRange(doc, trs, tre);
+      if (oldRefBms.length > 0) {
+        log("INFO", "段 #" + i + " 旧编号 " + trail.text + " 上有原生书签：" + oldRefBms.join(", "));
+      }
+    } catch (eBm) {}
+
     out.formulas.push({
       kind: "plain",
       para: i,
@@ -1036,6 +1047,7 @@ function collectFormulas(doc, options) {
       trailingRange: trail.range,
       trailingSame: trail.sameParagraph,
       trailingPara: trail.paraIndex,
+      oldRefBms: oldRefBms,
       mixed: mixed,
       inline: (ty !== 0)
     });
@@ -1089,7 +1101,12 @@ function clearCell(cell) {
     cell.Range.Text = "";
     return String(cell.Range.Text);
   });
-  if (r.ok && String(r.value).replace(/[\s\u0007]/g, "") === "") return true;
+
+  var mathCount = -1;
+  try { mathCount = Number(cell.Range.OMaths.Count); } catch (eM) {}
+
+  // 文本为空不代表清干净：数学区（公式对象）没有文本，必须单独判断
+  if (r.ok && String(r.value).replace(/[\s\u0007]/g, "") === "" && !(mathCount > 0)) return true;
 
   var r2 = run(function () {
     var rr = cell.Range;
@@ -1097,7 +1114,11 @@ function clearCell(cell) {
     rr.Delete();
     return true;
   });
-  return r2.ok;
+  if (!r2.ok) return false;
+
+  var left = -1;
+  try { left = Number(cell.Range.OMaths.Count); } catch (eM2) {}
+  return !(left > 0);
 }
 
 function applyTableLayout(doc, table, maxChars, layout) {
@@ -1265,9 +1286,39 @@ function writeNumberCell(doc, table, name, level, startValue, deferUpdate) {
 
   deleteBookmarkIfExists(doc, name);
   if (!clearCell(cell)) {
-    log("FAIL", "清空编号单元格失败：" + name);
-    return null;
+    // 只告警不中断：确保用户仍能完成编号，事后可重排修正
+    log("WARN", "编号单元格未完全清空（可能残留数学区），继续写入：" + name);
   }
+
+  // 拆分/转表后单元格里可能残留数学区（空公式容器）。若不先删掉，
+  // 随后插入的 "(" 、"." 会被 WPS 吸进公式区，编号变成 m:r 数学文本，
+  // 结果就是：引用更新正常，但光标停在编号上会打开公式编辑器。
+  var mathRemoved = 0;
+  for (var mi = 0; mi < 6; mi++) {
+    var mc = 0;
+    try { mc = Number(cell.Range.OMaths.Count); } catch (eMath0) { break; }
+    if (!(mc > 0)) break;
+
+    // WPS 的 OMath 没有 Delete()，用它的 Range 删除；
+    // 再退一步用 Text 清空，两种都试
+    var md = run(function () {
+      var om = cell.Range.OMaths.Item(1);
+      om.Range.Delete();
+      return true;
+    });
+    if (!md.ok) {
+      md = run(function () {
+        cell.Range.OMaths.Item(1).Range.Text = "";
+        return true;
+      });
+    }
+    if (!md.ok) {
+      log("WARN", "删除编号单元格内残留公式失败：" + md.error);
+      break;
+    }
+    mathRemoved++;
+  }
+  if (mathRemoved > 0) log("INFO", "已清除编号单元格内残留公式 " + mathRemoved + " 个");
 
   var start = -1;
   try { start = Number(cell.Range.Start); } catch (e1) { return null; }
@@ -1317,6 +1368,15 @@ function writeNumberCell(doc, table, name, level, startValue, deferUpdate) {
     return true;
   });
 
+  // 写完后复核：编号不应落在数学区里
+  try {
+    var postMath = Number(cell.Range.OMaths.Count);
+    if (postMath > 0) {
+      log("FAIL", "编号仍落在公式区内（残留公式 " + postMath + " 个）：" + name +
+        "，引用会显示为对象");
+    }
+  } catch (ePM) {}
+
   var bStart = start;
   var bEnd = (end2 >= 0) ? (end2 + 1) : -1;
   if (bEnd < 0) {
@@ -1328,7 +1388,23 @@ function writeNumberCell(doc, table, name, level, startValue, deferUpdate) {
       doc.Bookmarks.Add(name, doc.Range(bStart, bEnd));
       return true;
     });
-    if (!br.ok) log("WARN", "书签创建失败 " + name + "：" + br.error);
+    if (!br.ok) {
+      log("WARN", "书签创建失败 " + name + "：" + br.error);
+    } else {
+      // 诊断：确认书签只包住编号文字，不包含公式对象
+      try {
+        var bmObj = doc.Bookmarks.Item(name);
+        var bmText = String(bmObj.Range.Text).replace(/[\r\n]/g, "\\n");
+        var bmMath = -1, bmParas = -1;
+        try { bmMath = Number(bmObj.Range.OMaths.Count); } catch (eBm1) {}
+        try { bmParas = Number(bmObj.Range.Paragraphs.Count); } catch (eBm2) {}
+        log("INFO", "书签 " + name + " 范围 " + bStart + ".." + bEnd +
+          " 文本=" + clip(bmText, 40) + " 公式数=" + bmMath + " 段落数=" + bmParas);
+        if (bmMath > 0 || bmParas > 1) {
+          log("WARN", "书签 " + name + " 范围异常（含公式或多段），引用可能显示为对象");
+        }
+      } catch (eBm3) {}
+    }
   }
 
   run(function () { cell.Range.ParagraphFormat.Alignment = 2; return true; });
@@ -1394,43 +1470,71 @@ function preparePlainFormula(doc, f) {
   var p2 = f.p;
   if (!p2) return null;
 
-  // 制表符插在“段落标记之前”，确保落在公式外面。
-  // 用 OMath.Range.End 定位时，WPS 可能把制表符算进公式，转表结果会嵌到公式内部。
-  var pe = -1;
-  try { pe = Number(p2.Range.End) - 1; } catch (ePe) { return null; }
-  if (pe < 0) return null;
+  // 建表方案的取舍（均经实测）：
+  // 1) ConvertToTable("\t")：制表符被 WPS 吸进数学模型，右栏残留裸 m:r，
+  //    编号变成数学文字，引用显示为对象，保存后数学区还会吞掉后续正文。
+  // 2) 建空表 + FormattedText 赋值：加载项环境下写入必卡死（跨进程死锁）。
+  // 3) 建空表 + 剪贴板：可用，但每处理一个公式就覆盖一次用户剪贴板。
+  // 4) ConvertToTable(0) + Cell.Split：可用，但右栏从数学段落克隆了 m:rPr，
+  //    编号仍被当成数学区，引用照样显示为对象。
+  // 现方案：建 1×2 空表（两栏都是普通段落）+ 把公式的 WordOpenXML 片段插入左栏。
+  // 左栏拿到公式，右栏始终是普通段落，既不碰剪贴板也不经过 FormattedText 赋值。
 
-  run(function () { doc.Range(pe, pe).InsertAfter("\t"); return true; });
-
-  var ptxt = "";
-  try { ptxt = String(p2.Range.Text); } catch (ePt) {}
-  if (ptxt.indexOf("\t") < 0) {
-    log("FAIL", "段 #" + f.para + " 插入制表符失败");
+  // 删旧编号、裁剪空白后扫描阶段捕获的 OMath 可能已失效，重新取一次
+  var freshOm = null;
+  try { freshOm = p2.Range.OMaths.Item(1); } catch (eFO) {}
+  if (!freshOm) {
+    log("FAIL", "段 #" + f.para + " 找不到可搬运的公式对象");
     return null;
   }
 
-  var tbl = null;
-  var cr = run(function () { return p2.Range.ConvertToTable("\t"); });
-  if (cr.ok && cr.value) tbl = cr.value;
-  else {
-    try { tbl = doc.Tables.Item(doc.Tables.Count); } catch (e3) {}
-  }
-  if (!tbl) {
-    log("FAIL", "段落转两栏表格失败（段 #" + f.para + "）");
+  var wxml = null;
+  var wr = run(function () {
+    var w = freshOm.Range.WordOpenXML;
+    wxml = (typeof w === "function") ? String(w.call(freshOm.Range)) : String(w);
+    return true;
+  });
+  if (!wr.ok || !wxml || wxml.length < 50) {
+    log("FAIL", "段 #" + f.para + " 读取公式 XML 失败：" + (wr.ok ? "内容为空" : wr.error));
     return null;
   }
 
-  // 校验：必须是两栏，且公式在第一栏；否则说明表格被嵌进了公式对象
-  var cellCount = -1;
-  try { cellCount = Number(tbl.Range.Cells.Count); } catch (eCC) {}
-  var omInCell = -1;
-  try { omInCell = Number(tbl.Cell(1, 1).Range.OMaths.Count); } catch (eOC) {}
+  var pe2 = -1;
+  try { pe2 = Number(p2.Range.End); } catch (ePe) { return null; }
+  if (pe2 < 0) return null;
 
-  if (omInCell === 0 || (cellCount > 0 && cellCount !== 2)) {
-    log("FAIL", "段 #" + f.para + " 转表结果异常（栏数=" + cellCount +
-      "，第一栏公式数=" + omInCell + "），疑似表格被嵌入公式，请手动检查");
+  var tr = run(function () { return doc.Tables.Add(doc.Range(pe2, pe2), 1, 2); });
+  if (!tr.ok || !tr.value) {
+    log("FAIL", "段 #" + f.para + " 创建两栏空表失败：" + (tr.ok ? "返回空" : tr.error));
     return null;
   }
+  var tbl = tr.value;
+
+  var ins = run(function () { tbl.Cell(1, 1).Range.InsertXML(wxml); return true; });
+  if (!ins.ok) {
+    log("FAIL", "段 #" + f.para + " 公式插入左栏失败：" + ins.error);
+    try { tbl.Delete(); } catch (eDI) {}
+    return null;
+  }
+
+  var omLeft = -1;
+  var omRight = -1;
+  try { omLeft = Number(tbl.Cell(1, 1).Range.OMaths.Count); } catch (eML) {}
+  try { omRight = Number(tbl.Cell(1, 2).Range.OMaths.Count); } catch (eMR) {}
+  log("INFO", "段 #" + f.para + "：公式已插入左栏（左栏公式=" + omLeft + "，右栏公式=" + omRight + "）");
+
+  if (!(omLeft > 0)) {
+    log("FAIL", "段 #" + f.para + " 插入后左栏没有公式，放弃");
+    try { tbl.Delete(); } catch (eDL) {}
+    return null;
+  }
+  if (omRight > 0) {
+    log("WARN", "段 #" + f.para + " 右栏含公式对象，编号可能显示异常");
+  }
+
+  // 删除原公式段落（公式已插入表格）
+  var delP = run(function () { p2.Range.Delete(); return true; });
+  if (!delP.ok) log("WARN", "段 #" + f.para + " 删除原公式段落失败：" + delP.error);
 
   return tbl;
 }
@@ -1581,242 +1685,257 @@ function updateRefFields(doc, mode) {
 }
 
 /* ------------------------------------------------------------
- * 旧编号引用替换（通用函数）
- * 用途：全文/本章重编号完成后，把正文里指向旧编号的引用替换成新编号。
- *       宏版和加载项版共用，支持本章/全文范围。
+ * 旧编号引用修复
+ * 用途：全文/本章重编号或单公式编号后，让正文里的原生 REF 域继续有效。
+ *       做法是在新编号上重建旧书签，域代码完全不动。
+ *       正文中手打的纯文本引用（如 式(1.1)）不替换。
  * ------------------------------------------------------------ */
 
-// 读完整个文档，收集所有 EQNUM_NUM_ 书签的当前文本
-function readAllBookmarkTexts(doc) {
-  var m = {};
-  var items = listOurBookmarks(doc);
-  for (var i = 0; i < items.length; i++) {
-    var txt = (items[i].text || "").replace(/^\s+|\s+$/g, "");
-    if (txt) m[items[i].name] = txt;
+// 在新编号上重建旧的原生书签（_RefXXXX），让正文 REF 域无需改写即可继续工作。
+// 这比改写域代码更贴近原生交叉引用的行为：引用仍是原生的 REF 域。
+function readdRefBookmarks(doc, oldNames, newName) {
+  var res = { added: 0, failed: 0, okNames: {}, range: "" };
+  if (!oldNames || oldNames.length === 0) return res;
+  if (!newName) { res.failed = oldNames.length; return res; }
+
+  var ns = -1, ne = -1;
+  try {
+    var bm = doc.Bookmarks.Item(newName);
+    ns = Number(bm.Start);
+    ne = Number(bm.End);
+  } catch (e0) {
+    try {
+      var bm2 = doc.Bookmarks.Item(newName);
+      ns = Number(bm2.Range.Start);
+      ne = Number(bm2.Range.End);
+    } catch (e1) {
+      res.failed = oldNames.length;
+      return res;
+    }
   }
-  return m;
+  if (!(ne > ns)) { res.failed = oldNames.length; return res; }
+  res.range = ns + ".." + ne;
+
+  for (var i = 0; i < oldNames.length; i++) {
+    var nm = oldNames[i];
+    try {
+      // 同名书签可能残留（旧段落未删净），先删再建
+      try { if (doc.Bookmarks.Exists(nm)) doc.Bookmarks.Item(nm).Delete(); } catch (eD) {}
+      doc.Bookmarks.Add(nm, doc.Range(ns, ne));
+      res.okNames[nm] = true;
+      res.added++;
+    } catch (e2) { res.failed++; }
+  }
+  return res;
 }
 
-// 从 renumberAll 的 list 构建 { 旧编号文本: 新编号文本 } 映射
-// 必须在所有域更新完之后调用（新编号是 SEQ/STYLEREF 结果）
-function collectOldNewMap(list, bmTexts) {
-  var map = {};
-  for (var i = 0; i < list.length; i++) {
-    var f = list[i];
-    var oldTxt = (f.trailing || "").replace(/^\s+|\s+$/g, "");
-    if (!oldTxt) continue;
-    var newTxt = bmTexts[f.bookmarkName] || "";
-    if (!newTxt) continue;
-    if (oldTxt === newTxt) continue;
-    if (map[oldTxt] && map[oldTxt] !== newTxt) {
-      log("WARN", "同一旧编号 " + oldTxt + " 被映射到多个新编号（" +
-        map[oldTxt] + " 与 " + newTxt + "），仅保留首次");
+function escapeRegExpStr(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// 收集与 [start, end) 重叠的书签，排除本工具自己的 EQNUM_ 书签。
+// 原生交叉引用会在被引用的编号上放一个 _RefXXXX 书签，删号时它一起消失，
+// 正文里 REF 它就变成无来源引用，必须在删号前记下来。
+//
+// WPS Linux 上 Bookmarks 集合的行为与 Word 不完全一致，这里按三级策略取：
+//   1) Range.Bookmarks（范围级集合，最直接）
+//   2) doc.Bookmarks 枚举 + Start/End
+//   3) doc.Bookmarks 枚举 + Range.Start/End
+//   4) Range.InRange(bm.Range)（拿不到位置时的兜底）
+function bookmarksInRange(doc, start, end) {
+  var out = [];
+  if (!(end > start)) return out;
+
+  function pushName(nm, seen) {
+    if (!nm) return seen;
+    if (nm.indexOf("EQNUM_") === 0) return seen;
+    if (seen[nm]) return seen;
+    seen[nm] = true;
+    out.push(nm);
+    return seen;
+  }
+
+  var seen = {};
+  var rng = null;
+  try { rng = doc.Range(start, end); } catch (e0) { return out; }
+
+  // WPS 默认屏蔽以 "_" 开头的隐藏书签，先尝试打开
+  try { doc.Bookmarks.ShowHidden = true; } catch (eSH) {}
+
+  // 1) 范围级书签集合（同时试编号范围与其所在整段，
+  //    因为 WPS 可能只返回完全包含在范围内的书签，而 _Ref 常包住整段）
+  var probeRanges = [rng];
+  try { probeRanges.push(rng.Paragraphs.Item(1).Range); } catch (eP) {}
+
+  for (var pr = 0; pr < probeRanges.length; pr++) {
+    try {
+      var rbms = probeRanges[pr].Bookmarks;
+      var rn = Number(rbms.Count);
+      for (var r = 1; r <= rn; r++) {
+        try { seen = pushName(String(rbms.Item(r).Name), seen); } catch (e1) {}
+      }
+    } catch (e2) {}
+  }
+
+  if (out.length > 0) return out;
+
+  // 注意：不要为“按名兜底”去遍历 doc.Fields。
+  // 大文档有 7000+ 域，WPS 的 Fields.Item(索引) 是线性查找，
+  // 循环会退化成 O(n²)，表现为点击按钮后长时间无响应。
+  // 书签集合在 ShowHidden=true 后已能正常返回，无需这条路径。
+
+  // 3) 全文档枚举
+  var bms = null;
+  try { bms = doc.Bookmarks; } catch (e3) {
+    log("WARN", "doc.Bookmarks 不可用，无法捕获旧编号书签：" + errText(e3));
+    return out;
+  }
+
+  var total = -1;
+  try { total = Number(bms.Count); } catch (e4) {}
+
+  var limit = (total >= 0) ? total : 500;
+  var noPos = 0;
+  var itemFail = 0;
+
+  for (var i = 1; i <= limit; i++) {
+    var bm = null;
+    try { bm = bms.Item(i); } catch (e5) {
+      itemFail++;
+      if (total < 0) break;      // 无 Count 时逐个试，取到失败即停
       continue;
     }
-    map[oldTxt] = newTxt;
+
+    var nm = "";
+    try { nm = String(bm.Name); } catch (e6) { continue; }
+    if (!nm || nm.indexOf("EQNUM_") === 0) continue;
+
+    var bs = -1, be = -1, posOk = false;
+
+    try { bs = Number(bm.Start); be = Number(bm.End); posOk = true; }
+    catch (e7) {
+      try { bs = Number(bm.Range.Start); be = Number(bm.Range.End); posOk = true; }
+      catch (e8) {}
+    }
+
+    if (posOk) {
+      if (be > start && bs < end) seen = pushName(nm, seen);
+      continue;
+    }
+
+    // 4) 拿不到位置：用 InRange 判断
+    noPos++;
+    try {
+      if (rng.InRange(bm.Range)) seen = pushName(nm, seen);
+    } catch (e9) {}
   }
-  return map;
+
+  // 诊断：一次都不命中且存在定位失败时，把原因记进日志
+  if (out.length === 0 && noPos > 0) {
+    log("WARN", "旧编号范围 " + start + ".." + end + " 内有 " + noPos +
+      " 个书签无法定位（Start/End 与 Range 均不可用），可能导致引用无法修复");
+  }
+  if (out.length === 0 && itemFail > 0 && total >= 0) {
+    log("WARN", "Bookmarks.Item(索引) 有 " + itemFail + " 次失败，共 " + total + " 个书签");
+  }
+
+  return out;
 }
 
-// 通用：在 doc 上做安全的正文引用替换。
-// mapping: { "(1.1)": "(2.1)", ... }  旧→新编号文本对
-// opts:
-//   prefix      正文引用的前缀，默认 CFG.refPrefix || "式"
-//   bareParen   是否额外替换裸 "(旧)" → "(新)" 模式（默认 false，较危险）
-//   scope       "full" | "chapter" （默认 "full"；chapter 需 opts.chapterStart/End）
-//   chapterStart/chapterEnd  scope="chapter" 时的段号范围（可选）
-//   progressCb  function(done, total, text)  进度回调（加载项环境用）
-// 返回 { replaced: number, pairs: number, usedMs: number }
-function scanAndReplaceOldRefs(doc, mapping, opts) {
+// 修复域引用：把指向旧书签的 REF 域改指向新书签。
+// 这条路径只改域代码、不碰正文文字，所以新旧编号文本相同也照样生效，
+// 不会再留下"指向已删除书签"的死引用。
+// map: { 旧书签名: 新书签名 }
+function repointRefFields(doc, map, opts) {
   opts = opts || {};
-  var prefix = opts.prefix || CFG.refPrefix || "式";
-  var bareParen = !!opts.bareParen;
-  var scope = opts.scope || "full";
-  var progressCb = opts.progressCb;
 
-  var pairs = Object.keys(mapping);
-  if (pairs.length === 0) return { replaced: 0, pairs: 0, usedMs: 0 };
+  var names = [];
+  for (var k in map) {
+    if (Object.prototype.hasOwnProperty.call(map, k)) names.push(k);
+  }
+  if (names.length === 0) return { scanned: 0, repointed: 0, usedMs: 0 };
 
-  // 按旧编号文本长度倒序：避免短编号误替换长编号的前缀
-  // 例：若 (1) 和 (1.1) 都在映射里，先换 (1.1) 才能防止 (1) 把 (1.1) 先拆坏
-  pairs.sort(function (a, b) { return b.length - a.length; });
+  // 长名优先，避免 _Ref1 抢先改掉 _Ref12 的前缀
+  names.sort(function (a, b) { return b.length - a.length; });
 
-  log("INFO", "=== 开始正文引用替换（" + pairs.length + " 对） ===");
-  var tAll = Date.now();
-  var totalOps = pairs.length * (bareParen ? 2 : 1);
-  var done = 0;
-  var replaced = 0;
+  var t0 = Date.now();
 
-  // 构造 Find 作用范围：全文 Content 或章段范围
-  var searchRange = null;
-  try {
-    if (scope === "chapter" && opts.chapterStart > 0 && opts.chapterEnd > 0) {
-      var rStart = Number(doc.Paragraphs.Item(opts.chapterStart).Range.Start);
-      var rEnd = Number(doc.Paragraphs.Item(opts.chapterEnd).Range.End);
-      searchRange = doc.Range(rStart, rEnd);
-      log("INFO", "替换范围：章段 " + opts.chapterStart + " ~ " + opts.chapterEnd);
-    } else {
-      searchRange = doc.Content;
-      log("INFO", "替换范围：全文");
+  var fields = null;
+  try { fields = doc.Fields; } catch (e0) {
+    log("WARN", "无法访问文档域集合，跳过域引用修复：" + errText(e0));
+    return { scanned: 0, repointed: 0, usedMs: Date.now() - t0 };
+  }
+
+  var total = 0;
+  try { total = Number(fields.Count); } catch (e1) {}
+
+  // WPS 的 Fields.Item(索引) 是线性查找，逐条遍历大文档会退化成 O(n²)。
+  // 正常情况下引用已通过“重建同名书签”保持有效，这里只兜底，故设上限。
+  if (total > 4000) {
+    log("WARN", "文档域数过多（" + total + "），跳过逐域扫描以避免界面卡死；" +
+      "引用依赖已重建的原生书签维持，如需彻底修复请先拆分成小文档");
+    return { scanned: 0, repointed: 0, usedMs: Date.now() - t0 };
+  }
+
+  log("INFO", "=== 修复域引用：共 " + total + " 个域，待修复旧书签 " + names.length + " 个 ===");
+
+  // 第一遍只读：收集需要改的域索引与新代码
+  var jobs = [];
+  for (var i = 1; i <= total; i++) {
+    var fd = null;
+    try { fd = fields.Item(i); } catch (e2) { continue; }
+
+    var code = "";
+    try { code = String(fd.Code.Text); } catch (e3) { continue; }
+    if (!code || !/\bREF\b/i.test(code)) continue;
+
+    var next = code;
+    for (var j = 0; j < names.length; j++) {
+      var oldName = names[j];
+      var re = new RegExp("(^|[^A-Za-z0-9_])" + escapeRegExpStr(oldName) + "(?![A-Za-z0-9_])", "g");
+      var rep = next.replace(re, function (m, p1) { return p1 + map[oldName]; });
+      if (rep !== next) next = rep;
     }
-  } catch (eRange) {
-    log("WARN", "构造搜索范围失败，回退到全文：" + errText(eRange));
-    searchRange = doc.Content;
-  }
-
-  // 关屏幕更新（减少重排开销）
-  var oldScreen = null;
-  try { var sv = Application.ScreenUpdating; if (sv !== undefined && sv !== null) oldScreen = !!sv; } catch (eS0) {}
-  try { Application.ScreenUpdating = false; } catch (eS1) {}
-
-  var findObj = null;
-  try { findObj = searchRange.Find; } catch (eF0) {}
-  if (!findObj) {
-    log("FAIL", "无法获取 Find 对象，引用替换中止");
-    try { Application.ScreenUpdating = oldScreen; } catch (eS2) {}
-    return { replaced: 0, pairs: pairs.length, usedMs: 0 };
-  }
-
-  try {
-    for (var i = 0; i < pairs.length; i++) {
-      var oldNum = pairs[i];
-      var newNum = mapping[oldNum];
-
-      // 模式 1：前缀 + 编号（安全）
-      try {
-        findObj.ClearFormatting();
-        findObj.Replacement.ClearFormatting();
-      } catch (eClr) {}
-
-      try {
-        findObj.Text = prefix + oldNum;
-        findObj.Replacement.Text = prefix + newNum;
-        findObj.Forward = true;
-        findObj.Wrap = 0; // wdFindStop
-        findObj.MatchCase = false;
-        findObj.MatchWholeWord = false;
-        findObj.MatchWildcards = false;
-        findObj.MatchSoundsLike = false;
-        findObj.MatchAllWordForms = false;
-
-        // 用 Execute 而非 ExecuteOld（WPS 兼容）
-        var r1 = null;
-        try {
-          r1 = findObj.Execute({
-            FindText: prefix + oldNum,
-            ReplaceWith: prefix + newNum,
-            Forward: true,
-            Wrap: 0,
-            Replace: 2 // wdReplaceAll
-          });
-        } catch (eEx1) {
-          // 15 参数老式
-          try { findObj.Execute(prefix + oldNum, false, false, false, false, false, true, 0, false, prefix + newNum, 2); }
-          catch (eEx1b) {}
-        }
-
-        // 至少 Execute 过一次就算走过流程；WPS 不返回替换计数
-        done++;
-        log("INFO", "引用替换 [" + (i + 1) + "/" + pairs.length + "] " +
-          prefix + oldNum + " → " + prefix + newNum + "（前缀模式）");
-      } catch (ePat1) {
-        log("WARN", "前缀模式替换失败 " + prefix + oldNum + "：" + errText(ePat1));
-        done++;
-      }
-
-      if (bareParen) {
-        try {
-          findObj.ClearFormatting();
-          findObj.Replacement.ClearFormatting();
-        } catch (eClr2) {}
-        try {
-          // 裸括号模式：前后是非字母数字非括号字符或文档边界
-          // Word 的 Find 不支持 lookbehind，改用通配符 + 捕获组
-          // 模式：([!A-Za-z0-9\(\)（）]) + oldNum → \1 + newNum
-          findObj.MatchWildcards = true;
-          findObj.Text = "([!A-Za-z0-9\\(\\)（）])" + escapeForWildcard(oldNum);
-          findObj.Replacement.Text = "\\1" + escapeReplaceBackslash(newNum);
-          findObj.Forward = true;
-          findObj.Wrap = 0;
-
-          try {
-            findObj.Execute({
-              FindText: "([!A-Za-z0-9\\(\\)（）])" + escapeForWildcard(oldNum),
-              ReplaceWith: "\\1" + escapeReplaceBackslash(newNum),
-              Forward: true,
-              Wrap: 0,
-              Replace: 2,
-              MatchWildcards: true
-            });
-          } catch (eEx2) {
-            try { findObj.Execute("([!A-Za-z0-9\\(\\)（）])" + escapeForWildcard(oldNum),
-              false, false, false, false, false, true, 0, false,
-              "\\1" + escapeReplaceBackslash(newNum), 2, true); }
-            catch (eEx2b) {}
-          }
-          log("INFO", "引用替换 [" + (i + 1) + "/" + pairs.length + "] 裸括号 " + oldNum + " → " + newNum);
-        } catch (ePat2) {
-          log("WARN", "裸括号模式替换失败 " + oldNum + "：" + errText(ePat2));
-        }
-        done++;
-      }
-
-      if (progressCb) {
-        try { progressCb(done, totalOps,
-          "替换引用 " + (i + 1) + "/" + pairs.length + "：" + oldNum + " → " + newNum); }
-        catch (eP) {}
-      }
+    if (next !== code) {
+      var cs = -1, ce = -1;
+      try { cs = Number(fd.Code.Start); ce = Number(fd.Code.End); } catch (eCs) {}
+      jobs.push({ index: i, from: code, to: next, cs: cs, ce: ce });
     }
-  } finally {
-    try { Application.ScreenUpdating = oldScreen; } catch (eS3) {}
+
+    if (opts.progressCb && total > 500 && i % 500 === 0) {
+      try { opts.progressCb(i, total, "扫描域引用 " + i + "/" + total); } catch (ePg) {}
+    }
   }
 
-  // 替换完必须刷所有域：SEQ 计数器、REF 引用、STYLEREF
-  log("INFO", "引用替换完成，用时 " + (Date.now() - tAll) + "ms，开始刷全部域");
-  var tUp = Date.now();
-  var tr = run(function () { doc.Fields.Update(); return 0; });
-  if (!tr.ok) log("WARN", "全局域更新失败：" + errText(tr.error));
-  log("INFO", "全局域更新用时 " + (Date.now() - tUp) + "ms");
+  // 第二遍写入并更新
+  var okCount = 0;
+  for (var q = 0; q < jobs.length; q++) {
+    var job = jobs[q];
+    var f2 = null;
+    try { f2 = fields.Item(job.index); } catch (e4) { continue; }
 
-  var used = Date.now() - tAll;
-  log("INFO", "=== 正文引用替换结束：共 " + pairs.length + " 对，用时 " + used + "ms ===");
-  return { replaced: replaced, pairs: pairs.length, usedMs: used };
-}
+    var written = false;
+    try { f2.Code.Text = job.to; written = true; } catch (e5) {}
+    if (!written) {
+      try { f2.Code = job.to; written = true; } catch (e6) {}
+    }
+    if (!written && job.cs >= 0 && job.ce > job.cs) {
+      // 最后兜底：直接改写域代码所在的 Range
+      try { doc.Range(job.cs, job.ce).Text = job.to; written = true; } catch (e6b) {}
+    }
+    if (!written) {
+      log("WARN", "改写域代码失败（域 #" + job.index + "）：" + clip(job.from, 60));
+      continue;
+    }
 
-function escapeForWildcard(s) {
-  // Word 通配符里要转的：\ [ ] { } < > ( ) @ * ? -
-  return String(s).replace(/([\\\[\]{}<>()@*?\-])/g, "\\$1");
-}
-function escapeReplaceBackslash(s) {
-  // 替换字符串里的 \ 和 $ 要转成 \\ 和 \$
-  return String(s).replace(/\\/g, "\\\\").replace(/\$/g, "\\$");
-}
-
-// 三选一对话框，返回："update" / "skip" / "cancel"
-function askRefReplaceOption(mapping) {
-  if (!mapping || Object.keys(mapping).length === 0) return "skip";
-
-  var pairs = Object.keys(mapping);
-  var msg = "检测到 " + pairs.length + " 个旧编号已变化：\r";
-  var previewMax = Math.min(pairs.length, 8);
-  for (var i = 0; i < previewMax; i++) {
-    msg += pairs[i] + " → " + mapping[pairs[i]] + "\r";
+    try { f2.Update(); } catch (e7) {}
+    okCount++;
+    log("INFO", "域引用修复 #" + job.index + "：" + clip(job.from, 50) + " → " + clip(job.to, 50));
   }
-  if (pairs.length > previewMax) msg += "……（共 " + pairs.length + " 对）\r";
 
-  msg += "\r";
-  msg += "是否将正文中的旧编号引用一并替换？\r";
-  msg += "  1. 更新旧编号的引用（推荐；较慢，但正文完整）\r";
-  msg += "  2. 忽略旧编号的引用（更快；正文引用需手动更新）\r";
-  msg += "  C / 取消（放弃本次重编号）\r\r";
-  msg += "请输入选项 [1/2/C]";
-
-  var ans = InputBox(msg, "EQNUM 引用更新", "1");
-  if (ans === null || ans === undefined) return "cancel";
-  var a = String(ans).replace(/\s/g, "").toLowerCase();
-  if (a === "1" || a === "") return "update";
-  if (a === "2") return "skip";
-  return "cancel";
+  var used = Date.now() - t0;
+  log("INFO", "=== 域引用修复完成：修复 " + okCount + " 个，用时 " + used + "ms ===");
+  return { scanned: total, repointed: okCount, usedMs: used };
 }
 
 function listOurBookmarks(doc) {
@@ -2038,6 +2157,20 @@ async function renumberAll(doc, collected, options) {
     list[0].startValue = CFG.start;
   }
 
+  // —— 旧编号引用：域引用由新编号上的同名书签自动修复 ——
+  // 正文里手打的纯文本引用（如 式(1.1)）不做替换，避免误改。
+  var refOldCount = 0;
+  var refBmCount = 0;
+  for (var rq = 0; rq < list.length; rq++) {
+    var rqe = list[rq];
+    if (rqe.trailing) refOldCount++;
+    if (rqe.oldRefBms && rqe.oldRefBms.length > 0) refBmCount += rqe.oldRefBms.length;
+  }
+  if (refOldCount > 0 || refBmCount > 0) {
+    log("INFO", "检测到旧编号 " + refOldCount + " 个（被正文域引用书签 " + refBmCount +
+      " 个）：编号后将重建同名书签，纯文本引用不替换");
+  }
+
   var done = 0;
   var failed = 0;
   var cancelled = false;
@@ -2148,6 +2281,7 @@ async function renumberAll(doc, collected, options) {
         continue;
       }
       done++;
+      f.doneOk = true;
 
       log("INFO", "编号 " + seqNo + "/" + list.length + "：段 #" + f.para +
         " 完成，用时 " + (Date.now() - tItem) + "ms（旧号 " + tDel +
@@ -2173,37 +2307,43 @@ async function renumberAll(doc, collected, options) {
     log("INFO", "=== 开始更新编号域 ===");
     updateOurSeqFields(doc);
 
+    // —— 域引用修复：旧编号上的原生书签已随删号消失 ——
+    // 把正文里 REF 旧书签的域改指向新书签。只改域代码，不看新旧编号文本，
+    // 因此编号相同也照样修复，不会留下无来源引用。
+    var refBmMap = {};
+    var refBmMapped = 0;
+    var readded = 0;
+    for (var rb = 0; rb < list.length; rb++) {
+      var fe = list[rb];
+      if (!fe.oldRefBms || fe.oldRefBms.length === 0) continue;
+      if (!fe.bookmarkName) continue;
+      if (!fe.doneOk) continue;   // 编号写入失败的条目，新书签并不存在
+
+      // 首选：在新编号上重建同名原生书签，正文引用无需改写
+      var rr = readdRefBookmarks(doc, fe.oldRefBms, fe.bookmarkName);
+      readded += rr.added;
+
+      for (var rbi = 0; rbi < fe.oldRefBms.length; rbi++) {
+        var onm = fe.oldRefBms[rbi];
+        if (rr.okNames[onm]) continue;   // 已重建，保留原生引用
+        refBmMap[onm] = fe.bookmarkName;
+        refBmMapped++;
+      }
+    }
+    if (readded > 0) {
+      log("INFO", "在新编号上重建原生书签：" + readded + " 个（正文 REF 域保持原生，无需改写）");
+    }
+    // 重建失败的书签：改写域代码指向新书签
+    if (refBmMapped > 0) {
+      reportProgress(list.length, list.length, "修复域引用（" + refBmMapped + " 个旧书签）");
+      repointRefFields(doc, refBmMap, { progressCb: reportProgress });
+    } else {
+      log("INFO", "旧编号上没有遗留原生书签，无域引用需修复");
+    }
+
     reportProgress(list.length, list.length, "刷新引用");
     log("INFO", "=== 开始更新引用域 ===");
     var refs = updateRefFields(doc, CFG.refreshRefs);
-
-    // —— 旧编号引用替换（通用挂接）——
-    // 只在有成功完成的编号、且捕获到旧 trailing 编号时触发
-    var oldNewMap = null;
-    if (done > 0) {
-      var bmTexts = readAllBookmarkTexts(doc);
-      oldNewMap = collectOldNewMap(list, bmTexts);
-      log("INFO", "旧编号→新编号映射：" + Object.keys(oldNewMap).length + " 对");
-    }
-
-    if (oldNewMap && Object.keys(oldNewMap).length > 0) {
-      reportProgress(list.length, list.length, "询问是否替换正文引用");
-      var choice = askRefReplaceOption(oldNewMap);
-      if (choice === "update") {
-        reportProgress(list.length, list.length, "替换正文引用");
-        var replaceResult = scanAndReplaceOldRefs(doc, oldNewMap, {
-          scope: options.scopeChapter ? "chapter" : "full",
-          chapterStart: options.chapterStart || 0,
-          chapterEnd: options.chapterEnd || 0,
-          progressCb: reportProgress
-        });
-        log("INFO", "正文引用替换完成：共 " + replaceResult.pairs + " 对，用时 " + replaceResult.usedMs + "ms");
-      } else if (choice === "skip") {
-        log("INFO", "用户选择忽略正文引用替换");
-      } else {
-        log("WARN", "用户选择取消（重编号已生效，引用替换未执行；如需回退请 Ctrl+Z）");
-      }
-    }
 
     log("INFO", "=== 全文重编号结束：成功 " + done + "，失败 " + failed +
       "，引用 " + refs + "，总用时 " + (Date.now() - tAll) + "ms ===");
@@ -2215,74 +2355,6 @@ async function renumberAll(doc, collected, options) {
     try { Application.ScreenUpdating = oldScreen; } catch (eScreen2) {}
     status("");
   }
-}
-
-function runDebugCandidates(doc) {
-  section("候选诊断（只读）");
-
-  var total = 0;
-  try { total = Number(doc.Paragraphs.Count); } catch (e0) { return; }
-  log("INFO", "开始诊断：段落总数 " + total + "，最多输出前 20 个候选");
-
-  var found = 0;
-  var scanned = 0;
-
-  for (var i = 1; i <= total && found < 20; i++) {
-    if (i % 500 === 0) {
-      status("候选诊断：" + i + " / " + total);
-      log("INFO", "已扫描段落 " + i + " / " + total + "，候选 " + found);
-    }
-
-    var p = null;
-    try { p = doc.Paragraphs.Item(i); } catch (e1) { continue; }
-    scanned++;
-
-    var omCount = 0;
-    try { omCount = Number(p.Range.OMaths.Count); } catch (e2) { continue; }
-    if (omCount !== 1) continue;
-
-    var om = null;
-    try { om = p.Range.OMaths.Item(1); } catch (e3) { continue; }
-
-    var trail = findTrailingNumber(doc, p, om, i);
-    if (!trail.found) continue;
-
-    found++;
-
-    var ty = -1;
-    try { ty = Number(om.Type); } catch (e4) {}
-    var mixed = formulaMixed(doc, p, om, trail);
-
-    log("INFO", "候选 #" + found + " 段 #" + i +
-      " Type=" + ty +
-      " 混排=" + (mixed ? "是" : "否") +
-      " 旧号=" + trail.text +
-      " 同段=" + (trail.sameParagraph ? "是" : "否") +
-      " 编号段=#" + trail.paraIndex);
-
-    var ptext = "";
-    try { ptext = String(p.Range.Text); } catch (e5) {}
-    log("INFO", "  本段=" + clip(ptext.replace(/[\r\u0007]/g, ""), 160));
-
-    if (!trail.sameParagraph) {
-      var tp = null;
-      try { tp = doc.Paragraphs.Item(trail.paraIndex); } catch (e6) {}
-      if (tp) {
-        var ttext = "";
-        try { ttext = String(tp.Range.Text); } catch (e7) {}
-        var tOm = 0;
-        var tShape = 0;
-        try { tOm = Number(tp.Range.OMaths.Count); } catch (e8) {}
-        try { tShape = Number(tp.Range.InlineShapes.Count); } catch (e9) {}
-        log("INFO", "  编号段文本=" + clip(ttext.replace(/[\r\u0007]/g, ""), 160) +
-          "（OMaths=" + tOm + "，InlineShapes=" + tShape + "）");
-      }
-    }
-  }
-
-  status("");
-  log("INFO", "诊断完成：扫描 " + scanned + " 段，输出 " + found + " 个候选");
-  alert("候选诊断完成，详见宏日志。\r最多输出前 20 个候选。");
 }
 
 async function runRenumber(doc) {
@@ -2526,12 +2598,28 @@ function runCurrent(doc) {
   // 删除公式后面已有的旧编号（同段或后续段落，不跨分页/分节符）
   var paraIndex = -1;
   var oldTrailText = "";
+  var oldRefBms = [];
   try { paraIndex = Number(doc.Range(0, p.Range.Start).Paragraphs.Count) + 1; } catch (eIdx) {}
 
   if (paraIndex > 0) {
     var trail = findTrailingNumber(doc, p, target, paraIndex);
     if (trail.found && trail.range) {
       oldTrailText = (trail.text || "").replace(/^\s+|\s+$/g, "");
+      // 删号前先记下旧编号上的原生书签，删完就找不回来了
+      try {
+        oldRefBms = bookmarksInRange(doc,
+          Number(trail.range.Start), Number(trail.range.End));
+        if (oldRefBms.length > 0) {
+          log("INFO", "当前公式旧编号 " + oldTrailText +
+            " 上有原生书签：" + oldRefBms.join(", "));
+        } else {
+          var bmTotal = -1;
+          try { bmTotal = Number(doc.Bookmarks.Count); } catch (eBmC) {}
+          log("WARN", "当前公式旧编号上未检测到原生书签（文档书签总数=" +
+            bmTotal + "）。若正文引用报“未定义书签”，请检查文档书签是否被隐藏");
+        }
+      } catch (eBm0) {}
+
       removeOldNumber(doc, trail, "当前");
       try { p = target.Range.Paragraphs.Item(1); } catch (eRe) {}
     }
@@ -2560,11 +2648,13 @@ function runCurrent(doc) {
   } catch (eType) {}
 
   var f = { para: 0, p: p, om: target, kind: "plain", h1: "", h2: "" };
+  var tStage = Date.now();
   var table = preparePlainFormula(doc, f);
   if (!table) {
     alert("公式转为两栏表格失败，请查看宏日志");
     return;
   }
+  log("INFO", "建表完成，用时 " + (Date.now() - tStage) + "ms");
 
   var maxChars = 10;
   var items = listOurBookmarks(doc);
@@ -2572,7 +2662,9 @@ function runCurrent(doc) {
     if (items[k].text.length > maxChars) maxChars = items[k].text.length;
   }
 
+  tStage = Date.now();
   applyTableLayout(doc, table, maxChars);
+  log("INFO", "排版完成，用时 " + (Date.now() - tStage) + "ms");
 
   var nextId = maxBookmarkId(doc) + 1;
   var name = makeBookmarkName(nextId);
@@ -2580,33 +2672,47 @@ function runCurrent(doc) {
   if (CFG.mode === "continuous" && listOurBookmarks(doc).length === 0) {
     startValue = CFG.start;
   }
+  tStage = Date.now();
   var field = writeNumberCell(doc, table, name, CFG.level, startValue);
   if (!field) {
     alert("写入编号失败，请查看宏日志。\r表格已生成但右列为空，可删除后重试。");
     return;
   }
+  log("INFO", "写入编号完成，用时 " + (Date.now() - tStage) + "ms");
 
   var shown = "";
   try { shown = String(table.Cell(1, 2).Range.Text).replace(/[\r\u0007]/g, ""); } catch (eShow) {}
 
   log("INFO", "当前公式已编号：" + shown + "，书签：" + name);
 
-  // —— 单公式：若删掉了旧 trailing 编号，可能存在正文引用需要同步 ——
-  if (oldTrailText && oldTrailText !== shown) {
-    var singleMap = {};
-    singleMap[oldTrailText] = shown;
-    // 让 SEQ/STYLEREF 计数器更新到最新位置
-    updateOurSeqFields(doc);
+  // 让 SEQ/STYLEREF 计数器更新到最新位置
+  tStage = Date.now();
+  updateOurSeqFields(doc);
+  log("INFO", "更新编号域完成，用时 " + (Date.now() - tStage) + "ms");
 
-    var choice = askRefReplaceOption(singleMap);
-    if (choice === "update") {
-      scanAndReplaceOldRefs(doc, singleMap, { scope: "full" });
-    } else if (choice === "skip") {
-      log("INFO", "单公式：用户选择忽略正文引用替换");
-    } else {
-      log("WARN", "单公式：用户取消（编号已生效，引用替换未执行）");
+  // —— 旧编号引用处理：域引用靠重建同名书签修好，纯文本引用不替换 ——
+  var needRepoint = [];
+  if (oldRefBms.length > 0) {
+    var rrSingle = readdRefBookmarks(doc, oldRefBms, name);
+    if (rrSingle.added > 0) {
+      log("INFO", "单公式：在新编号上重建原生书签 " + rrSingle.added +
+        " 个，范围 " + rrSingle.range);
+    }
+    for (var rbk = 0; rbk < oldRefBms.length; rbk++) {
+      if (!rrSingle.okNames[oldRefBms[rbk]]) needRepoint.push(oldRefBms[rbk]);
     }
   }
+
+  // 重建失败的书签才改写域代码指向
+  if (needRepoint.length > 0) {
+    var singleRefMap = {};
+    for (var rbm = 0; rbm < needRepoint.length; rbm++) singleRefMap[needRepoint[rbm]] = name;
+    log("INFO", "单公式：修复 " + needRepoint.length + " 个旧书签的域引用");
+    repointRefFields(doc, singleRefMap, {});
+  }
+
+  tStage = Date.now();
+  log("INFO", "旧编号引用处理完成，用时 " + (Date.now() - tStage) + "ms");
 }
 
 function findControlInCollection(controls, depth) {
@@ -2764,7 +2870,7 @@ async function main() {
   // 加载项页面也会加载本文件，此时没有宏入口传入的 mode，直接返回
   if (typeof mode === "undefined" || !mode) return;
 
-  log("INFO", "EQNUM 版本：2026-11-25-v12（正文引用替换：检测到旧编号变化后三选一对话框；通用 scanAndReplaceOldRefs 支持 prefix/裸括号/章范围）");
+  log("INFO", "EQNUM 版本：2026-11-26-v32（旧编号引用只重建同名书签；已移除调试停点与调试入口）");
 
   if (mode === "settings") {
     var d0 = ensureDocument();
@@ -2785,7 +2891,6 @@ async function main() {
     else if (mode === "refresh") return await runRefresh(doc);
     else if (mode === "insertref") return await runInsertRef(doc);
     else if (mode === "updaterefs") return await runUpdateRefs(doc);
-    else if (mode === "debugscan") return await runDebugCandidates(doc);
     else alert("未知操作：" + mode);
   } catch (e) {
     alert("执行异常：" + errText(e));

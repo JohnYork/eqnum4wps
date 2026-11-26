@@ -5,12 +5,14 @@
       <tab idMso="TabInsert">
         <group id="EqnumGroup" label="公式编号">
           <button id="btnCurrent" label="编号当前公式" size="large"
+                  getImage="GetImage"
                   onAction="OnBtnCurrent" getEnabled="OnGetEnabled" getVisible="OnGetVisible"/>
           <button id="btnChapter" label="本章重编号"
                   onAction="OnBtnChapter" getEnabled="OnGetEnabled" getVisible="OnGetVisible"/>
           <button id="btnRenumber" label="全文重编号"
                   onAction="OnBtnRenumber" getEnabled="OnGetEnabled" getVisible="OnGetVisible"/>
           <button id="btnInsertRef" label="插入引用" size="large"
+                  getImage="GetImage"
                   onAction="OnBtnInsertRef" getEnabled="OnGetEnabled" getVisible="OnGetVisible"/>
           <button id="btnUpdateRefs" label="刷新引用"
                   onAction="OnBtnUpdateRefs" getEnabled="OnGetEnabled" getVisible="OnGetVisible"/>

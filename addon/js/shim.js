@@ -36,12 +36,10 @@ function InputBox(msg, title, def) {
   return def;
 }
 
-// 加载项里由用户点击按钮即视为确认；保留开关便于调试
-window.__EQNUM_AUTO_CONFIRM = true;
-
+// 加载项里由用户点击按钮即视为确认
 window.confirm = function (msg) {
   eqnumEmit("[确认] " + String(msg).replace(/\r/g, " "), "warn");
-  return !!window.__EQNUM_AUTO_CONFIRM;
+  return true;
 };
 
 window.alert = function (msg) {
