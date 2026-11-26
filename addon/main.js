@@ -5,7 +5,8 @@
  * 功能区只负责打开任务窗格并投递动作，真正的编号逻辑在 ui/panel.html 里运行。
  */
 
-var EQNUM_ADDON_VERSION = "0.2.8";
+var EQNUM_ADDON_VERSION = "0.2.9";
+var EQNUM_ADDON_BUILD = 12;
 var g_ribbonUI = null;
 
 // 诊断：每个功能区回调都先 alert 一下，便于定位问题（稳定后关闭）
@@ -23,8 +24,8 @@ function OnAddinLoad(ribbonUI) {
   try {
     g_ribbonUI = ribbonUI;
     try { window.Application.ribbonUI = ribbonUI; } catch (e) {}
-    try { window.Application.PluginStorage.setItem("EQNUM_LOADED", EQNUM_ADDON_VERSION); } catch (e2) {}
-    try { console.log("[EQNUM] 加载项已载入，版本 " + EQNUM_ADDON_VERSION + "，路径 " + GetUrlPath()); } catch (e3) {}
+    try { window.Application.PluginStorage.setItem("EQNUM_LOADED", EQNUM_ADDON_VERSION + " build " + EQNUM_ADDON_BUILD); } catch (e2) {}
+    try { console.log("[EQNUM] 加载项已载入，版本 " + EQNUM_ADDON_VERSION + " build " + EQNUM_ADDON_BUILD + "，路径 " + GetUrlPath()); } catch (e3) {}
   } catch (eAll) {
     try { alert("EQNUM OnAddinLoad 异常：" + eqnumErr(eAll)); } catch (ex) {}
   }

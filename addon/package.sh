@@ -6,8 +6,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJ="$(cd "$ROOT/.." && pwd)"
 VERSION="$(sed -n 's/.*EQNUM_ADDON_VERSION = "\([^"]*\)".*/\1/p' "$ROOT/main.js" | head -n 1)"
 [ -n "$VERSION" ] || { echo "无法从 main.js 读取版本号" >&2; exit 1; }
+BUILD="$(sed -n 's/.*EQNUM_ADDON_BUILD = \([0-9]*\).*/\1/p' "$ROOT/main.js" | head -n 1)"
+[ -n "$BUILD" ] || BUILD=0
 
-NAME="eqnum-${VERSION}"
+NAME="eqnum-${VERSION}-build${BUILD}"
 DIST="$PROJ/dist"
 STAGE="$(mktemp -d)"
 PKG="$STAGE/$NAME"
@@ -18,12 +20,14 @@ trap cleanup EXIT
 mkdir -p "$PKG/addon/js" "$PKG/addon/ui" "$PKG/addon/images"
 cp "$ROOT/index.html" "$ROOT/main.js" "$ROOT/ribbon.xml" "$PKG/addon/"
 cp "$ROOT/js/"*.js "$PKG/addon/js/"
+# 核心实现以 src 为准，覆盖 addon/js 里的副本，避免打进旧版本
+cp "$PROJ/src/wps-eqnum.js" "$PKG/addon/js/wps-eqnum.js"
 cp "$ROOT/ui/"* "$PKG/addon/ui/"
 cp "$ROOT/images/"*.png "$PKG/addon/images/"
 
-sed "s/__VERSION__/${VERSION}/g" "$ROOT/pkg/install.sh"   > "$PKG/install.sh"
-sed "s/__VERSION__/${VERSION}/g" "$ROOT/pkg/uninstall.sh" > "$PKG/uninstall.sh"
-sed "s/__VERSION__/${VERSION}/g" "$ROOT/pkg/README.txt"   > "$PKG/README.txt"
+sed -e "s/__VERSION__/${VERSION}/g" -e "s/__BUILD__/${BUILD}/g" "$ROOT/pkg/install.sh"   > "$PKG/install.sh"
+sed -e "s/__VERSION__/${VERSION}/g" -e "s/__BUILD__/${BUILD}/g" "$ROOT/pkg/uninstall.sh" > "$PKG/uninstall.sh"
+sed -e "s/__VERSION__/${VERSION}/g" -e "s/__BUILD__/${BUILD}/g" "$ROOT/pkg/README.txt"   > "$PKG/README.txt"
 chmod +x "$PKG/install.sh" "$PKG/uninstall.sh"
 
 bash -n "$PKG/install.sh"
@@ -57,5 +61,5 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
 print("[package] zip: %s" % out)
 PY
 
-echo "[package] 版本：$VERSION"
+echo "[package] 版本：$VERSION build $BUILD"
 ls -lh "$DIST/${NAME}-linux.tar.gz" "$DIST/${NAME}-linux.zip"
