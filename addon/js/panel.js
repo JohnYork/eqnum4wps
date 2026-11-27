@@ -7,7 +7,7 @@
  *   panel.js      → 本文件，负责界面、设置存储、动作调度、日志展示
  */
 
-var EQNUM_PANEL_VERSION = "0.2.8";
+var EQNUM_PANEL_VERSION = "0.2.9";
 var MAX_LOG_LINES = 1500;
 var g_busy = false;
 var g_progText = "";

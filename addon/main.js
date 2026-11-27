@@ -5,7 +5,7 @@
  * 功能区只负责打开任务窗格并投递动作，真正的编号逻辑在 ui/panel.html 里运行。
  */
 
-var EQNUM_ADDON_VERSION = "0.2.8";
+var EQNUM_ADDON_VERSION = "0.2.9";
 var g_ribbonUI = null;
 
 // 诊断：每个功能区回调都先 alert 一下，便于定位问题（稳定后关闭）

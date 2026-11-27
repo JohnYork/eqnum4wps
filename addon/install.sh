@@ -3,7 +3,7 @@
 set -euo pipefail
 
 NAME="eqnum"
-VERSION="0.2.8"
+VERSION="0.2.9"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JSADDONS="${WPS_JSADDONS_DIR:-$HOME/.local/share/Kingsoft/wps/jsaddons}"
 TARGET="$JSADDONS/${NAME}_${VERSION}"
