@@ -203,11 +203,13 @@ function headingNumber(p) {
   return m ? m[1] : "";
 }
 
-// 去掉空白、制表位、段落标记、单元格标记和旧编号
+// 去掉空白、制表位、段落标记、单元格标记和旧编号。
+// 还要去掉 WPS 在公式/分段附近可能留下的零宽字符与对象占位符，
+// 否则拆分后会被误判成“仍与正文混排”。
 function cleanAllowed(s) {
   s = String(s);
   s = s.replace(/[\(（]\s*\d+(?:\s*[-.]\s*\d+)*\s*[\)）]/g, "");
-  s = s.replace(/[\s\u0007]/g, "");
+  s = s.replace(/[\s\u0000-\u001F\u007F\u00A0\u3000\u200B-\u200D\u2028\u2029\uFEFF\uFFFC]/g, "");
   return s;
 }
 
@@ -479,6 +481,18 @@ function isolateFormula(doc, p, om) {
     omEnd = Number(om.Range.End);
   } catch (e0) { return { ok: false, reason: "无法读取公式范围" }; }
 
+  // 参考公式在拆段前记录；这里不再做“行内→显示”转换——
+  // WPS 转换后会插入软回车，导致公式看似独立成行却仍与正文同段。
+  // 显示转换改到公式进入表格左栏之后再做。
+  var wantKey = mathKeyOf(om);
+  var refStart = omStart;
+  var wantXml = mathXmlOf(om);
+  var refXmlCore = mathXmlCore(wantXml);
+  if (wantKey || refXmlCore) {
+    log("INFO", "拆分校验：参考公式 文本=" + clip(wantKey, 30) +
+      "，XML=" + refXmlCore.length + " 字符，起点=" + refStart);
+  }
+
   var before = "";
   var after = "";
   try { before = String(doc.Range(pStart, omStart).Text); } catch (e1) {}
@@ -501,33 +515,339 @@ function isolateFormula(doc, p, om) {
     }
   }
 
-  var bClean = before.replace(/[ \t\v\n\r\u00A0\u3000\u001E\u001F\u2028\u2029]/g, "");
-  var aClean = after.replace(/[ \t\v\n\r\u00A0\u3000\u001E\u001F\u2028\u2029]/g, "");
-  var needBefore = bClean.length > 0;
-  var needAfter = aClean.length > 0;
+  var needBefore = cleanAllowed(before).length > 0;
+  var needAfter = cleanAllowed(after).length > 0;
 
+  var brkB = -1;
+  var brkA = -1;
   if (needBefore) {
-    var r1 = run(function () { om.Range.InsertParagraphBefore(); return true; });
-    if (!r1.ok) return { ok: false, reason: "插入前分段失败：" + r1.error };
+    brkB = splitBeforeOmath(doc, om);
+    if (brkB === -1) return { ok: false, reason: "公式前插入段落标记失败" };
   }
   if (needAfter) {
-    var r2 = run(function () { om.Range.InsertParagraphAfter(); return true; });
-    if (!r2.ok) return { ok: false, reason: "插入后分段失败：" + r2.error };
+    brkA = splitAfterOmath(doc, om);
+    if (brkA === -1) return { ok: false, reason: "公式后插入段落标记失败" };
   }
 
-  var p2 = null;
+  // 插段后 OMath.Range 可能停在旧位置（实测 Start 会落在上一段的段落标记上），
+  // 所以改用“插入点”定位公式所在段落，再用文本/XML 找回公式对象。
+  var guess = omStart;
+  if (brkB >= 0) guess = brkB + 1;
+  else if (brkA >= 0) guess = Math.max(0, brkA - 1);
+  else if (brkB === -2 || brkA === -2) guess = omStart + (needBefore ? 1 : 0);
+
   var om2 = null;
-  try { p2 = om.Range.Paragraphs.Item(1); } catch (e3) {}
+  var p2 = null;
+  var verified = false;
+
+  var pr = run(function () { return doc.Range(guess, guess).Paragraphs.Item(1); });
+  if (pr.ok && pr.value) p2 = pr.value;
+
+  if (p2) {
+    // 把该段内残留的软回车换成段落标记（WPS 偶尔仍插软回车）
+    var fixedBreaks = hardenSoftBreaksInPara(doc, p2);
+    if (fixedBreaks > 0) {
+      log("INFO", "拆分校验：已把 " + fixedBreaks + " 个软回车替换为段落标记");
+      var pr2 = run(function () { return doc.Range(guess, guess).Paragraphs.Item(1); });
+      if (pr2.ok && pr2.value) p2 = pr2.value;
+    }
+
+    om2 = reacquireOmath(p2, guess, wantKey, wantXml);
+    if (om2) {
+      verified = (!wantKey && !wantXml) ||
+        (!!wantKey && mathKeyOf(om2) === wantKey) ||
+        (!!wantXml && mathXmlCore(mathXmlOf(om2)) === refXmlCore);
+    }
+  }
+
+  if (!om2) om2 = nearestOmath(doc, guess);
+  if (!om2) return { ok: false, reason: "拆分后无法读取公式（位置 " + guess + "）" };
+
+  if (!p2) {
+    try {
+      var ps2 = Number(om2.Range.Start);
+      p2 = doc.Range(ps2, ps2).Paragraphs.Item(1);
+    } catch (e7) {}
+  }
   if (!p2) return { ok: false, reason: "拆分后无法读取段落" };
-  try { om2 = p2.Range.OMaths.Item(1); } catch (e4) {}
-  if (!om2) return { ok: false, reason: "拆分后无法读取公式" };
+
+  // 与拆分前记录的本体 XML/文本核对；核对通过就不用搜索，未通过才搜索兜底
+  var matched = null;
+  if (verified) {
+    log("INFO", "拆分校验：按插入点找回公式（未搜索）");
+  } else if (wantXml || wantKey) {
+    matched = findMathMatch(doc, wantXml, wantKey, p2);
+    if (matched) {
+      log("INFO", "拆分校验：搜索命中（" + matched.by + "）");
+      if (matched.p) p2 = matched.p;
+      if (matched.om) om2 = matched.om;
+    } else {
+      log("WARN", "拆分校验：未找到与原公式一致的 OMath，沿用找回结果");
+    }
+  }
+
+  var extraP = null;
 
   var info2 = standaloneInfo(doc, p2, om2);
   if (!info2.standalone) {
-    return { ok: false, reason: "拆分后公式仍与正文混排" };
+    // 诊断：把运行时读到的原始文本与位置写进日志，便于判断段落标记是否生效
+    var rawB = "";
+    var rawA = "";
+    var pS2 = -1, pE2 = -1, oS2 = -1, oE2 = -1;
+    try {
+      pS2 = Number(p2.Range.Start);
+      pE2 = Number(p2.Range.End);
+      oS2 = Number(om2.Range.Start);
+      oE2 = Number(om2.Range.End);
+      rawB = String(doc.Range(pS2, oS2).Text);
+      rawA = String(doc.Range(oE2, Math.max(oE2, pE2)).Text);
+    } catch (eDg) {}
+    log("WARN", "拆分校验诊断：段落=" + pS2 + ".." + pE2 + " 公式=" + oS2 + ".." + oE2);
+    log("WARN", "拆分校验诊断：前原文=" + esc(rawB));
+    log("WARN", "拆分校验诊断：后原文=" + esc(rawA));
+    return {
+      ok: false,
+      reason: "拆分后公式仍与正文混排（前=" + esc(info2.before) + "，后=" + esc(info2.after) + "）"
+    };
   }
 
-  return { ok: true, p: p2, om: om2 };
+  return { ok: true, p: p2, om: om2, wxml: wantXml, extraP: extraP };
+}
+
+// 全文 OMaths 中找离 pos 最近的一个，供拆分后对象失效时兜底
+function nearestOmath(doc, pos) {
+  var all = null;
+  try { all = doc.OMaths; } catch (e0) { return null; }
+
+  var total = 0;
+  try { total = Number(all.Count); } catch (e1) { return null; }
+
+  var best = null;
+  var bestD = 1e12;
+  for (var i = 1; i <= total; i++) {
+    var o = null;
+    try { o = all.Item(i); } catch (e2) { continue; }
+    var s = 0, e = 0;
+    try { s = Number(o.Range.Start); e = Number(o.Range.End); } catch (e3) { continue; }
+    var d = (pos < s) ? (s - pos) : (pos > e ? pos - e : 0);
+    if (d < bestD) { bestD = d; best = o; }
+  }
+  return best;
+}
+
+// 读取公式的 WordOpenXML 片段，失败返回空串
+function mathXmlOf(om) {
+  try {
+    var w = om.Range.WordOpenXML;
+    return (typeof w === "function") ? String(w.call(om.Range)) : String(w);
+  } catch (e) { return ""; }
+}
+
+function mathKeyOf(om) {
+  try { return String(om.Range.Text).replace(/\s/g, ""); } catch (e) { return ""; }
+}
+
+// 只取 oMath 本体，忽略行内/显示包装（m:oMathPara），便于两种形态互相比对
+function mathXmlCore(s) {
+  s = String(s || "");
+  var m = s.match(/<m:oMath(?:\s[^>]*)?>[\s\S]*?<\/m:oMath>/);
+  return m ? m[0] : s;
+}
+
+// 在段落里按“文本 → XML → 最近位置”找回指定公式，避免 Item(1) 选错对象
+function reacquireOmath(p, refStart, refKey, refXml) {
+  var c = 0;
+  try { c = Number(p.Range.OMaths.Count); } catch (e0) { c = 0; }
+  if (!(c > 0)) return null;
+
+  var i, o;
+
+  if (refKey) {
+    for (i = 1; i <= c; i++) {
+      o = null;
+      try { o = p.Range.OMaths.Item(i); } catch (e1) { continue; }
+      if (mathKeyOf(o) === refKey) return o;
+    }
+  }
+
+  if (refXml) {
+    var refCore = mathXmlCore(refXml);
+    for (i = 1; i <= c; i++) {
+      o = null;
+      try { o = p.Range.OMaths.Item(i); } catch (e2) { continue; }
+      if (mathXmlCore(mathXmlOf(o)) === refCore) return o;
+    }
+  }
+
+  var best = null;
+  var bestD = 1e12;
+  for (i = 1; i <= c; i++) {
+    o = null;
+    try { o = p.Range.OMaths.Item(i); } catch (e3) { continue; }
+    var s = 0, e = 0;
+    try { s = Number(o.Range.Start); e = Number(o.Range.End); } catch (e4) { continue; }
+    var d = (refStart < s) ? (s - refStart) : (refStart > e ? refStart - e : 0);
+    if (d < bestD) { bestD = d; best = o; }
+  }
+  return best;
+}
+
+// 收集段落及前后 span 段内的所有公式（按起始位置去重）
+function nearbyOmaths(p, span) {
+  var out = [];
+  var seen = {};
+
+  function addPara(par) {
+    if (!par) return;
+    var c = 0;
+    try { c = Number(par.Range.OMaths.Count); } catch (e0) { return; }
+    for (var i = 1; i <= c; i++) {
+      var o = null;
+      try { o = par.Range.OMaths.Item(i); } catch (e1) { continue; }
+      var st = -1;
+      try { st = Number(o.Range.Start); } catch (e2) { continue; }
+      if (seen[st]) continue;
+      seen[st] = 1;
+      out.push({ om: o, p: par });
+    }
+  }
+
+  addPara(p);
+  var cur = p;
+  for (var a = 0; a < span; a++) {
+    try { cur = cur.Next; } catch (eN) { cur = null; }
+    if (!cur) break;
+    addPara(cur);
+  }
+  cur = p;
+  for (var b = 0; b < span; b++) {
+    try { cur = cur.Previous; } catch (eP) { cur = null; }
+    if (!cur) break;
+    addPara(cur);
+  }
+  return out;
+}
+
+// 用拆分前记录的 XML/文本校对新位置上的公式；本地找不到时才全文搜索（兜底）
+function findMathMatch(doc, wantXml, wantKey, p) {
+  var cands = nearbyOmaths(p, 2);
+  var i;
+  var wantCore = wantXml ? mathXmlCore(wantXml) : "";
+
+  for (i = 0; i < cands.length; i++) {
+    if (wantCore && mathXmlCore(mathXmlOf(cands[i].om)) === wantCore) {
+      return { om: cands[i].om, p: cands[i].p, by: "XML" };
+    }
+  }
+
+  for (i = 0; i < cands.length; i++) {
+    if (wantKey && mathKeyOf(cands[i].om) === wantKey) {
+      return { om: cands[i].om, p: cands[i].p, by: "文本" };
+    }
+  }
+
+  var total = 0;
+  try { total = Number(doc.OMaths.Count); } catch (e0) { return null; }
+  if (!(total > 0)) return null;
+  if (total > 4000) {
+    log("WARN", "拆分校验：文档公式过多（" + total + "），跳过全文搜索");
+    return null;
+  }
+
+  for (i = 1; i <= total; i++) {
+    var o = null;
+    try { o = doc.OMaths.Item(i); } catch (e1) { continue; }
+    if (wantCore && mathXmlCore(mathXmlOf(o)) === wantCore) {
+      var par = null;
+      try {
+        var st = Number(o.Range.Start);
+        par = doc.Range(st, st).Paragraphs.Item(1);
+      } catch (e2) {}
+      return { om: o, p: par, by: "全文 XML" };
+    }
+  }
+  return null;
+}
+
+// 把一个位置的软回车（\v）换成段落标记（\r），成功返回 true
+function hardenSoftBreakAt(doc, pos) {
+  var ch = "";
+  try { ch = String(doc.Range(pos, pos + 1).Text); } catch (e0) { return false; }
+  if (ch !== "\v" && ch !== "\u000B" && ch !== "\u2028") return false;
+
+  var r1 = run(function () { doc.Range(pos, pos + 1).Text = "\r"; return true; });
+  if (r1.ok) {
+    try { if (String(doc.Range(pos, pos + 1).Text) === "\r") return true; } catch (e1) {}
+  }
+
+  var r2 = run(function () {
+    doc.Range(pos, pos + 1).Delete();
+    doc.Range(pos, pos).InsertParagraphAfter();
+    return true;
+  });
+  if (r2.ok) {
+    try { if (String(doc.Range(pos, pos + 1).Text) === "\r") return true; } catch (e2) {}
+  }
+  return false;
+}
+
+// 在公式前的正文与公式之间插入段落标记：操作正文最后一个字符，避免触碰数学区。
+// 返回插入点位置；-2 表示成功但位置不可知（走了回退方案）；-1 表示失败。
+function splitBeforeOmath(doc, om) {
+  var os = -1;
+  var ps = -1;
+  try {
+    os = Number(om.Range.Start);
+    ps = Number(om.Range.Paragraphs.Item(1).Range.Start);
+  } catch (e0) {}
+
+  if (os > ps) {
+    var a = run(function () { doc.Range(os - 1, os).InsertParagraphAfter(); return true; });
+    if (a.ok) return os;
+  }
+
+  var b = run(function () { om.Range.InsertParagraphBefore(); return true; });
+  return b.ok ? -2 : -1;
+}
+
+// 返回插入点位置；-2 成功但位置未知；-1 失败
+function splitAfterOmath(doc, om) {
+  var oe = -1;
+  var pe = -1;
+  try {
+    oe = Number(om.Range.End);
+    pe = Number(om.Range.Paragraphs.Item(1).Range.End);
+  } catch (e0) {}
+
+  if (oe < pe - 1) {
+    var a = run(function () { doc.Range(oe, oe + 1).InsertParagraphBefore(); return true; });
+    if (a.ok) return oe;
+  }
+
+  var b = run(function () { om.Range.InsertParagraphAfter(); return true; });
+  return b.ok ? -2 : -1;
+}
+
+// 把段落内所有软回车换成段落标记，返回替换个数
+function hardenSoftBreaksInPara(doc, p) {
+  var n = 0;
+  for (var pass = 0; pass < 4; pass++) {
+    var txt = "";
+    var s = -1;
+    try {
+      s = Number(p.Range.Start);
+      txt = String(p.Range.Text);
+    } catch (e0) { break; }
+
+    var i = txt.indexOf("\v");
+    if (i < 0) i = txt.indexOf("\u000B");
+    if (i < 0) i = txt.indexOf("\u2028");
+    if (i < 0) break;
+
+    if (!hardenSoftBreakAt(doc, s + i)) break;
+    n++;
+  }
+  return n;
 }
 
 function getTextWidth(doc) {
@@ -598,6 +918,34 @@ function loadConfig() {
   CFG.refreshRefs = (rr === "all" || rr === "none") ? rr : "ours";
   CFG.sub = readProp("EQNUM_SUB", "0") === "1" ? 1 : 0;
   CFG.subStyle = readProp("EQNUM_SUB_STYLE", "alpha");
+  applyConfigOverride();
+}
+
+// 面板保存设置到 A 文档、操作却发生在 B 文档时，两者会不一致。
+// 面板在每次执行动作前把界面上的设置放进 window.EQNUM_SETTINGS_OVERRIDE，
+// 这里以它为准，保证“界面上选的是什么，实际就按什么执行”。
+function applyConfigOverride() {
+  var o = null;
+  try {
+    if (typeof window !== "undefined" && window && window.EQNUM_SETTINGS_OVERRIDE) {
+      o = window.EQNUM_SETTINGS_OVERRIDE;
+    }
+  } catch (e0) { return; }
+  if (!o) return;
+
+  if (o.mode === "continuous" || o.mode === "chapter") CFG.mode = o.mode;
+  if (Number(o.level) === 2) CFG.level = 2;
+  else if (Number(o.level) === 1) CFG.level = 1;
+  var sv = Number(o.start);
+  if (sv >= 1) CFG.start = sv;
+  if (typeof o.refPrefix === "string") CFG.refPrefix = o.refPrefix;
+  if (o.refreshRefs === "all" || o.refreshRefs === "ours" || o.refreshRefs === "none") {
+    CFG.refreshRefs = o.refreshRefs;
+  }
+
+  log("INFO", "本次使用面板设置：模式=" + (CFG.mode === "chapter" ? "按章" : "连续") +
+    "，层级=" + CFG.level + "，起始值=" + CFG.start +
+    "，引用前缀=" + (CFG.refPrefix || "（无）") + "，刷新引用=" + CFG.refreshRefs);
 }
 
 function saveConfig() {
@@ -611,36 +959,32 @@ function saveConfig() {
 }
 
 function ensureDocument() {
-  // 选择 OMaths 最多的文档，避免误改探测报告等文档
-  var best = null;
-  var bestCount = -1;
-  var total = 0;
-  try { total = Number(Application.Documents.Count); } catch (e0) {}
-
-  for (var i = 1; i <= total; i++) {
-    var d = null;
-    try { d = Application.Documents.Item(i); } catch (e1) { continue; }
-    var c = -1;
-    try { c = Number(d.OMaths.Count); } catch (e2) {}
-    if (c > bestCount) {
-      bestCount = c;
-      best = d;
-    }
+  // 加载项里必须跟随“当前正在编辑的窗口”，不能擅自激活其它文档：
+  // 多文档时旧逻辑会挑 OMaths 最多的文档并激活它，导致操作总是落在第一个文档。
+  var d = null;
+  try { d = Application.ActiveWindow.Document; } catch (e0) {}
+  if (!d) {
+    try { d = Application.ActiveDocument; } catch (e1) {}
   }
-
-  if (best && bestCount > 0) {
-    run(function () { best.Activate(); return true; });
-    state.doc = best;
-    return best;
+  if (!d) {
+    try { if (Number(Application.Documents.Count) > 0) d = Application.Documents.Item(1); } catch (e2) {}
   }
-
-  var r = run(function () { return Application.ActiveDocument; });
-  if (!r.ok || !r.value) {
+  if (!d) {
     alert("没有打开的文档");
     return null;
   }
-  state.doc = r.value;
-  return r.value;
+  state.doc = d;
+  return d;
+}
+
+// 多窗口时 Selection 也要跟随活动窗口
+function activeSelection() {
+  var s = null;
+  try { s = Application.ActiveWindow.Selection; } catch (e0) {}
+  if (!s) {
+    try { s = Application.Selection; } catch (e1) {}
+  }
+  return s;
 }
 
 function showSummary(title) {
@@ -841,8 +1185,20 @@ function standaloneInfo(doc, p, om) {
 
   var before = "";
   var after = "";
-  try { before = String(doc.Range(pStart, omStart).Text); } catch (e3) {}
-  try { after = String(doc.Range(omEnd, pEnd).Text); } catch (e4) {}
+  try { before = String(doc.Range(Math.max(0, pStart), omStart).Text); } catch (e3) {}
+  try { after = String(doc.Range(omEnd, Math.max(omEnd, pEnd)).Text); } catch (e4) {}
+
+  // 以文本里实际存在的段落标记切出公式所在“行”：
+  // WPS 插入分段后，段落对象有时仍指向旧段落，但文本中的 \r 已经生效。
+  var bi = before.lastIndexOf("\r");
+  if (bi >= 0) before = before.substring(bi + 1);
+  var ai = after.indexOf("\r");
+  if (ai >= 0) after = after.substring(0, ai);
+
+  // 公式位置不在段落范围内，说明对象与实际段落已脱节
+  if (omStart < pStart || omEnd > pEnd) {
+    return { standalone: false, before: before, after: after, trailing: trailingNumber(after) };
+  }
 
   var cleanB = cleanAllowed(before);
   var cleanA = cleanAllowed(after);
@@ -853,6 +1209,37 @@ function standaloneInfo(doc, p, om) {
     after: after,
     trailing: trailingNumber(after)
   };
+}
+
+// 以文本里的段落标记为界，重新计算公式所在“行”的边界。
+// 用于 WPS 插段后段落对象未及时刷新的情况。
+function resolvePlainPara(doc, p, om) {
+  var pS = -1, pE = -1, oS = -1, oE = -1;
+  try {
+    pS = Number(p.Range.Start);
+    pE = Number(p.Range.End);
+    oS = Number(om.Range.Start);
+    oE = Number(om.Range.End);
+  } catch (e0) { return null; }
+
+  var startB = pS;
+  try {
+    var bt = String(doc.Range(pS, oS).Text);
+    var bi = bt.lastIndexOf("\r");
+    if (bi >= 0) startB = pS + bi + 1;
+  } catch (e1) {}
+
+  var endA = pE - 1;
+  try {
+    var at = String(doc.Range(oE, Math.max(oE, pE)).Text);
+    var ai = at.indexOf("\r");
+    if (ai >= 0) endA = oE + ai;
+  } catch (e2) {}
+
+  if (startB > oS) startB = oS;
+  if (endA < oE) endA = oE;
+
+  return { pStart: startB, pEnd: endA, omStart: oS, omEnd: oE };
 }
 
 function headingLevelOf(sn) {
@@ -1423,36 +1810,36 @@ function preparePlainFormula(doc, f) {
     return null;
   }
 
+  // 拆分后传进来的公式对象可能还指向旧位置，先确认它在段落范围内，否则重取
+  try {
+    var ps0 = Number(p.Range.Start);
+    var pe0 = Number(p.Range.End);
+    var os0 = Number(om.Range.Start);
+    var oe0 = Number(om.Range.End);
+    if (!(os0 >= ps0 && oe0 <= pe0)) om = p.Range.OMaths.Item(1);
+  } catch (eOmFix) {
+    try { om = p.Range.OMaths.Item(1); } catch (eOmFix2) { om = null; }
+  }
+  if (!om) {
+    log("FAIL", "段 #" + f.para + " 找不到公式对象，跳过");
+    return null;
+  }
+  f.om = om;
+
   var preInfo = standaloneInfo(doc, p, om);
   if (!preInfo.standalone) {
     log("FAIL", "段 #" + f.para + " 公式未与正文隔离，跳过");
     return null;
   }
 
-  var ty0 = null;
-  try { ty0 = Number(om.Type); } catch (eTy) {}
-  if (ty0 !== 0) {
-    var tr = run(function () { om.Type = 0; return true; });
-    if (tr.ok) {
-      try {
-        p = om.Range.Paragraphs.Item(1);
-        om = p.Range.OMaths.Item(1);
-        f.p = p;
-        f.om = om;
-      } catch (eTy2) {}
-    }
-  }
+  // 按文本里的段落标记重新确定边界：WPS 插段后段落对象可能仍是旧的
+  var bd = resolvePlainPara(doc, p, om);
+  if (!bd) return null;
 
-  var pStart = -1;
-  var pEnd = -1;
-  var omStart = -1;
-  var omEnd = -1;
-  try {
-    pStart = Number(p.Range.Start);
-    pEnd = Number(p.Range.End);
-    omStart = Number(om.Range.Start);
-    omEnd = Number(om.Range.End);
-  } catch (e0) { return null; }
+  var pStart = bd.pStart;
+  var pEnd = bd.pEnd;
+  var omStart = bd.omStart;
+  var omEnd = bd.omEnd;
 
   // 清掉公式前后可能残留的空白/旧编号，只留公式本身
   var shift = 0;
@@ -1463,8 +1850,8 @@ function preparePlainFormula(doc, f) {
 
   var p2End = pEnd - shift;
   var om2End = omEnd - shift;
-  if (p2End - 1 > om2End) {
-    run(function () { doc.Range(om2End, p2End - 1).Delete(); return true; });
+  if (p2End > om2End) {
+    run(function () { doc.Range(om2End, p2End).Delete(); return true; });
   }
 
   var p2 = f.p;
@@ -1483,24 +1870,34 @@ function preparePlainFormula(doc, f) {
   // 删旧编号、裁剪空白后扫描阶段捕获的 OMath 可能已失效，重新取一次
   var freshOm = null;
   try { freshOm = p2.Range.OMaths.Item(1); } catch (eFO) {}
-  if (!freshOm) {
-    log("FAIL", "段 #" + f.para + " 找不到可搬运的公式对象");
-    return null;
-  }
 
+  // 拆段时已记录原公式 XML：直接用它搬运，避免拆分把公式切碎后只搬到碎片
   var wxml = null;
-  var wr = run(function () {
-    var w = freshOm.Range.WordOpenXML;
-    wxml = (typeof w === "function") ? String(w.call(freshOm.Range)) : String(w);
-    return true;
-  });
-  if (!wr.ok || !wxml || wxml.length < 50) {
-    log("FAIL", "段 #" + f.para + " 读取公式 XML 失败：" + (wr.ok ? "内容为空" : wr.error));
-    return null;
+  if (f.wxml && String(f.wxml).length >= 50) {
+    wxml = String(f.wxml);
+    log("INFO", "段 #" + f.para + "：使用拆分前记录的公式 XML（" + wxml.length + " 字符）");
   }
 
-  var pe2 = -1;
-  try { pe2 = Number(p2.Range.End); } catch (ePe) { return null; }
+  if (!wxml) {
+    if (!freshOm) {
+      log("FAIL", "段 #" + f.para + " 找不到可搬运的公式对象");
+      return null;
+    }
+
+    var wr = run(function () {
+      var w = freshOm.Range.WordOpenXML;
+      wxml = (typeof w === "function") ? String(w.call(freshOm.Range)) : String(w);
+      return true;
+    });
+    if (!wr.ok || !wxml || wxml.length < 50) {
+      log("FAIL", "段 #" + f.para + " 读取公式 XML 失败：" + (wr.ok ? "内容为空" : wr.error));
+      return null;
+    }
+  }
+
+  // 表格插在“公式所在行”的段落标记之前，位置按最新文本重新解析
+  var bd2 = resolvePlainPara(doc, p2, f.om) || bd;
+  var pe2 = bd2.pEnd + 1;
   if (pe2 < 0) return null;
 
   var tr = run(function () { return doc.Tables.Add(doc.Range(pe2, pe2), 1, 2); });
@@ -1532,9 +1929,38 @@ function preparePlainFormula(doc, f) {
     log("WARN", "段 #" + f.para + " 右栏含公式对象，编号可能显示异常");
   }
 
-  // 删除原公式段落（公式已插入表格）
-  var delP = run(function () { p2.Range.Delete(); return true; });
+  // 公式进入左栏后再转为显示公式：此处四周没有正文，不会产生软回车粘连
+  var toDisplay = run(function () {
+    var lo = tbl.Cell(1, 1).Range.OMaths.Item(1);
+    if (Number(lo.Type) !== 0) lo.Type = 0;
+    return true;
+  });
+  if (!toDisplay.ok) {
+    log("WARN", "段 #" + f.para + " 左栏公式转显示失败：" + toDisplay.error);
+  }
+
+  // 删除原公式所在行：按最新文本边界删除，避免段落对象未刷新时误删前文
+  var bd3 = resolvePlainPara(doc, p2, f.om) || bd2;
+  var delP = run(function () {
+    doc.Range(bd3.pStart, bd3.pEnd + 1).Delete();
+    return true;
+  });
   if (!delP.ok) log("WARN", "段 #" + f.para + " 删除原公式段落失败：" + delP.error);
+
+  // 拆分时如果公式被切成碎片，碎片会留在另一个段落里；只在它已无正文时清理
+  if (f.extraP) {
+    var canClean = false;
+    try {
+      canClean = cleanAllowed(String(f.extraP.Range.Text)).length === 0;
+    } catch (eEp) {}
+    if (canClean) {
+      var dx = run(function () { f.extraP.Range.Delete(); return true; });
+      if (dx.ok) log("INFO", "段 #" + f.para + "：已清理拆分残留段落");
+      else log("WARN", "段 #" + f.para + "：清理残留段落失败 " + dx.error);
+    } else {
+      log("WARN", "段 #" + f.para + "：拆分残留段落含正文，未自动删除，请人工检查");
+    }
+  }
 
   return tbl;
 }
@@ -2246,6 +2672,8 @@ async function renumberAll(doc, collected, options) {
           }
           f.p = iso.p;
           f.om = iso.om;
+          f.wxml = iso.wxml || "";
+          f.extraP = iso.extraP || null;
         }
 
         status("段 #" + f.para + "：转两栏表格");
@@ -2422,7 +2850,7 @@ async function runRefresh(doc) {
   var curPara = null;
   var curChapter = "";
   try {
-    var sel = Application.Selection;
+    var sel = activeSelection();
     curPara = sel.Range.Paragraphs.Item(1);
     curChapter = chapterAt(doc, curPara, true);
   } catch (e0) {}
@@ -2455,7 +2883,7 @@ async function runRefresh(doc) {
 
   if (scope === "chapterScan") {
     reportProgress(0, 0, "扫描当前章节候选（此阶段界面可能短暂无响应）");
-    var selScan = Application.Selection;
+    var selScan = activeSelection();
     var curPara = 1;
     try { curPara = Number(doc.Range(0, selScan.Range.Start).Paragraphs.Count) + 1; } catch (eSel) {}
 
@@ -2520,7 +2948,7 @@ async function runRefresh(doc) {
 }
 
 function runCurrent(doc) {
-  var sr = run(function () { return Application.Selection; });
+  var sr = run(function () { return activeSelection(); });
   if (!sr.ok || !sr.value) {
     alert("无法获取光标位置");
     return;
@@ -2532,6 +2960,19 @@ function runCurrent(doc) {
 
   function pickNearest(list, pos) {
     if (!list || list.length === 0) return null;
+
+    // 光标落在某个公式范围内时，优先选它（多个包含时取范围最小的）
+    var inside = null;
+    var insideLen = 1e12;
+    for (var a = 0; a < list.length; a++) {
+      var as = 0, ae = 0;
+      try { as = Number(list[a].Range.Start); ae = Number(list[a].Range.End); } catch (eA) { continue; }
+      if (pos >= as && pos <= ae) {
+        if (ae - as < insideLen) { insideLen = ae - as; inside = list[a]; }
+      }
+    }
+    if (inside) return inside;
+
     var best = list[0];
     var bestD = 1e12;
     for (var k = 0; k < list.length; k++) {
@@ -2574,6 +3015,19 @@ function runCurrent(doc) {
     alert("无法确定目标公式");
     return;
   }
+
+  // 诊断：记录候选范围与选中项，用于定位“编号到错误公式”
+  log("INFO", "编号当前：光标位置=" + selStart + "，选区公式 " +
+    (r.ok ? Number(r.value.Count) : "读取失败") + " 个，候选 " + oms.length + " 个");
+  for (var di = 0; di < oms.length; di++) {
+    var ds = -1, de = -1, dt = "";
+    try { ds = Number(oms[di].Range.Start); de = Number(oms[di].Range.End); } catch (eDS) {}
+    try { dt = String(oms[di].Range.Text); } catch (eDT) {}
+    log("INFO", "  候选 #" + (di + 1) + " 范围 " + ds + ".." + de + " 文本=" + clip(dt, 30));
+  }
+  try {
+    log("INFO", "  选中范围 " + Number(target.Range.Start) + ".." + Number(target.Range.End));
+  } catch (eSel) {}
 
   var p = null;
   try { p = target.Range.Paragraphs.Item(1); } catch (e5) {
@@ -2625,6 +3079,8 @@ function runCurrent(doc) {
     }
   }
 
+  var isoWxml = "";
+  var isoExtraP = null;
   var info = standaloneInfo(doc, p, target);
   if (!info.standalone) {
     var msg = "该公式与正文混排，编号会在公式前后插入段落标记，把它拆成独立段落并生成两栏表格。\r\r点“确定”继续，点“取消”放弃。";
@@ -2632,22 +3088,21 @@ function runCurrent(doc) {
 
     var iso = isolateFormula(doc, p, target);
     if (!iso.ok) {
+      log("WARN", "公式拆分失败：" + iso.reason);
       alert("公式拆分失败：" + iso.reason);
       return;
     }
     p = iso.p;
     target = iso.om;
+    isoWxml = iso.wxml || "";
+    isoExtraP = iso.extraP || null;
   }
 
-  try {
-    if (Number(target.Type) !== 0) {
-      target.Type = 0;
-      p = target.Range.Paragraphs.Item(1);
-      target = p.Range.OMaths.Item(1);
-    }
-  } catch (eType) {}
+  // 类型转换统一放到公式进入表格左栏之后执行（见 preparePlainFormula），
+  // 避免在正文里转换触发 WPS 的软回车粘连。
 
-  var f = { para: 0, p: p, om: target, kind: "plain", h1: "", h2: "" };
+  var f = { para: 0, p: p, om: target, kind: "plain", h1: "", h2: "",
+    wxml: isoWxml, extraP: isoExtraP };
   var tStage = Date.now();
   var table = preparePlainFormula(doc, f);
   if (!table) {
@@ -2840,7 +3295,11 @@ function runInsertRef(doc) {
     return;
   }
 
-  var sel = Application.Selection;
+  var sel = activeSelection();
+  if (!sel) {
+    alert("无法获取光标位置");
+    return;
+  }
   var start = Number(sel.Range.Start);
   var prefix = CFG.refPrefix || "";
 
@@ -2870,7 +3329,7 @@ async function main() {
   // 加载项页面也会加载本文件，此时没有宏入口传入的 mode，直接返回
   if (typeof mode === "undefined" || !mode) return;
 
-  log("INFO", "EQNUM 版本：2026-11-26-v32（旧编号引用只重建同名书签；已移除调试停点与调试入口）");
+  log("INFO", "EQNUM 版本：2026-11-26-v44（插段后按插入点定位公式段落，不再信任 OMath.Range；去掉整篇重排）");
 
   if (mode === "settings") {
     var d0 = ensureDocument();

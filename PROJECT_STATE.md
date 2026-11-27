@@ -202,7 +202,7 @@
 ## 10. 回归测试顺序
 
 1. 关闭 WPS，复制目标 `.docm` 作为测试副本（目录里有锁文件 `.~...docm`）
-2. 加载项已部署到 `jsaddons/eqnum_0.2.8`；只需在「插入」标签点「公式编号」分组打开面板
+2. 加载项已部署到 `jsaddons/eqnum_0.2.9`；只需在「插入」标签点「公式编号」分组打开面板
 3. 在设置抽屉里确认：编号模式、章层级、刷新引用=仅本工具
 4. 光标放到第 1 章，点「本章重编号」
    - 日志开头版本应为 `2026-11-26-v32`
@@ -260,13 +260,14 @@
 | `addon/js/shim.js` | 适配层：`Application` 别名、`confirm/alert/InputBox` 转到面板日志、`console.log` 汇总到 `EQNUM_BUS` |
 | `addon/js/panel.js` | 面板逻辑：读写 `CustomDocumentProperties`、调度动作、日志渲染、轮询动作队列 |
 | `addon/install.sh` | 复制到 jsaddons 并维护 publish.xml；**把 `src/wps-eqnum.js` 复制为 `js/wps-eqnum.js`**（单一实现来源） |
-| `addon/package.sh` | 构建发布包：`dist/eqnum-<版本>-linux.{tar.gz,zip}`（版本号取自 main.js） |
+| `addon/package.sh` | 构建发布包：`dist/eqnum-<版本>-build<N>-linux.{tar.gz,zip}`（版本/build 取自 main.js） |
 | `addon/pkg/` | 发布包模板：`install.sh` / `uninstall.sh`（自动识别 jsaddons 路径）/ `README.txt` |
-| `dist/eqnum-0.2.8-linux.tar.gz`、`.zip` | 可直接分发的安装包，解压后 `bash install.sh` |
+| `dist/eqnum-0.2.9-build1-linux.tar.gz`、`.zip` | 可直接分发的安装包，解压后 `bash install.sh` |
 | `addon/uninstall.sh` | 删除目录并移除 publish.xml 条目 |
 
 **架构：核心逻辑复用宏脚本**
 - 面板页按 `shim.js → wps-eqnum.js → panel.js` 顺序加载，直接调用全局入口 `EQNUM_CURRENT/EQNUM_RENUMBER/EQNUM_REFRESH/EQNUM_INSERT_REF/EQNUM_UPDATE_REFS`
+- `addon/js/wps-eqnum.js` 只是运行时副本：`install.sh` 从 `src` 复制到安装目录，`package.sh` 打包前也用 `src` 覆盖，**禁止以它为改动来源**（build 1 曾因打包用了旧副本导致修复未生效）
 - `wps-eqnum.js` 里所有辅助函数与 `CFG/state` 都在 `EQNUM_MAIN()` 内部，加载时不会执行任何逻辑
 - `main()` 增加 `if (typeof mode === "undefined" || !mode) return;` 作为保险
 - 面板自己读写文档属性（键名与宏版一致：`EQNUM_MODE/LEVEL/START/REF_PREFIX/REFRESH_REFS`），不调用 `EQNUM_SETTINGS`
@@ -355,12 +356,17 @@
 - 加载项与宏共用同一套对象模型，性能瓶颈（每次编辑整篇重排）不会因改加载项而消失
 - 宏版仍是可用版本，加载项未稳定前不要删 `src/wps-eqnum.js`
 
-**阶段 5（0.2.8，当前状态）**
+**阶段 5（0.2.9 build 1，当前状态）**
 - 面板：5 个等宽竖排按钮（编号当前公式 / 本章重编号 / 全文重编号 / 插入引用 / 刷新引用）；设置、文档统计、日志均为可收起抽屉；进度条 + 中止 + 界面响应间隔
 - 功能区：并入内置「插入」标签的「公式编号」分组。WPS 不支持挂接「公式助手」等上下文标签，A–E 五个 idMso 候选全部落到自定义标签，该方案已作废
 - 建表（v30）：1×2 空表 + `Cell(1,1).Range.InsertXML(公式.WordOpenXML())`；右栏无数学属性，引用点击不再弹公式编辑器
 - 旧编号引用（v31）：只重建同名 `_Ref` 书签；删除面板「更新/忽略」单选与「执行前不再弹确认框」，不再替换纯文本引用
 - 调试代码（v32）：移除分阶段停点（`stageStop` / `EQNUM_STAGE`）、`EQNUM_DEBUG_SCAN` 入口与面板调试输入框；`probe/` 目录探针保留备查
-- 安装位置：`~/.local/share/Kingsoft/wps/jsaddons/eqnum_0.2.8`，`publish.xml` 条目 `version="0.2.8"`
+- 多文档与设置（v33）：`ensureDocument` 改为跟随活动窗口文档（不再按 OMaths 数量激活其它文档）；`Selection` 优先取 `ActiveWindow.Selection`；面板执行前把界面设置写入 `window.EQNUM_SETTINGS_OVERRIDE`，核心以它覆盖文档属性，修复“选连续仍按章编号”
+- 混排拆分（v34）：行内公式先转显示公式；拆分后按“原对象 → 位置 → 附近 → 全文最近”逐级找回公式；清理零宽字符/对象占位符，避免把成功拆分误判为混排
+- 版本约定：功能未稳定前版本号保持 0.2.9，只递增 `EQNUM_ADDON_BUILD`（面板标题、安装日志、安装包名均带 build）
+- 拆分校验（v36）：拆段前记录 OMath 的 `WordOpenXML` 与文本；拆段后先在同段±2 段内按 XML/文本核对，找不到才全文搜索（>4000 公式跳过）。搬运公式直接使用拆段前记录的 XML，避免拆碎后只搬到碎片；若碎片段落已无正文则自动清理
+- 选中公式与拆段（v41）：参照公式在拆段前记录（文本 + oMath 本体 XML）；**正文内不做行内→显示转换**（WPS 转换会插入软回车，导致公式看似独立成行却仍在同段），改为在“公式前正文末字符之后 / 公式后正文首字符之前”插入段落标记，失败才回退 `OMath.InsertParagraphBefore/After`，再把残留软回车替换为 `\r`；显示转换推迟到公式进入表格左栏之后执行。拆段后继续用同一 OMath 对象读 `Range` 定位，按本体 XML/文本核对，搜索仅作兜底
+- 安装位置：`~/.local/share/Kingsoft/wps/jsaddons/eqnum_0.2.9`，`publish.xml` 条目 `version="0.2.9"`
 - 已验证：单公式编号全阶段、本章重编号批量路径、引用 F9 更新、引用点击不再弹公式编辑器
 

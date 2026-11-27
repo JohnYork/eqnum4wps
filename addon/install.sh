@@ -3,8 +3,11 @@
 set -euo pipefail
 
 NAME="eqnum"
-VERSION="0.2.9"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION="$(sed -n 's/.*EQNUM_ADDON_VERSION = "\([^"]*\)".*/\1/p' "$ROOT/main.js" | head -n 1)"
+BUILD="$(sed -n 's/.*EQNUM_ADDON_BUILD = \([0-9]*\).*/\1/p' "$ROOT/main.js" | head -n 1)"
+[ -n "$VERSION" ] || { echo "[install] 无法从 main.js 读取版本号" >&2; exit 1; }
+[ -n "$BUILD" ] || BUILD=0
 JSADDONS="${WPS_JSADDONS_DIR:-$HOME/.local/share/Kingsoft/wps/jsaddons}"
 TARGET="$JSADDONS/${NAME}_${VERSION}"
 
@@ -66,5 +69,5 @@ ET.ElementTree(root).write(path, encoding="UTF-8", xml_declaration=True)
 print("[install] publish.xml 已更新: %s" % path)
 PY
 
-echo "[install] 已安装到 $TARGET"
+echo "[install] 已安装到 $TARGET（版本 $VERSION build $BUILD）"
 echo "[install] 重启 WPS 后，功能区「公式编号」按钮会打开右侧任务窗格"

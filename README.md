@@ -18,11 +18,11 @@
 
 ### 方式一：安装包（推荐）
 
-从 `dist/` 取对应版本，例如 `eqnum-0.2.8-linux.tar.gz`：
+从 `dist/` 取对应版本，例如 `eqnum-0.2.9-build1-linux.tar.gz`：
 
 ```bash
-tar -xzf eqnum-0.2.8-linux.tar.gz
-cd eqnum-0.2.8
+tar -xzf eqnum-0.2.9-build1-linux.tar.gz
+cd eqnum-0.2.9-build1
 bash install.sh
 ```
 
@@ -86,7 +86,7 @@ PROJECT_STATE.md      工程状态、实测结论与限制
 
 ## 版本
 
-当前版本 `0.2.8`。变更历史见 git 提交记录，详细实测结论见 [PROJECT_STATE.md](PROJECT_STATE.md)。
+当前版本 `0.2.9 build 1`。功能未稳定前只递增 build 号，版本号保持不变。变更历史见 git 提交记录，详细实测结论见 [PROJECT_STATE.md](PROJECT_STATE.md)。
 
 ## 许可
 

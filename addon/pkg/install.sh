@@ -5,6 +5,7 @@ set -euo pipefail
 
 NAME="eqnum"
 VERSION="__VERSION__"
+BUILD="__BUILD__"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$HERE/addon"
 
@@ -117,6 +118,6 @@ for f in index.html main.js ribbon.xml js/wps-eqnum.js js/panel.js js/shim.js ui
   [ -f "$TARGET/$f" ] || die "安装校验失败，缺少 $TARGET/$f"
 done
 
-log "安装完成（版本 $VERSION）"
+log "安装完成（版本 $VERSION build $BUILD）"
 log "下一步：完全退出并重启 WPS，然后在「插入」标签的「公式编号」分组里使用。"
 log "若功能区未出现，请删除 $JSADDONS/authaddin.json 后再次重启 WPS。"

@@ -1,4 +1,4 @@
-eqnum 公式编号（WPS Linux 加载项）v__VERSION__
+eqnum 公式编号（WPS Linux 加载项）v__VERSION__ build __BUILD__
 ================================================
 
 在 WPS 文字中为公式自动编号，支持按章编号 (2.1) 与连续编号 (1)，

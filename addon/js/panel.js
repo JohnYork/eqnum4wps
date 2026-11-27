@@ -8,6 +8,7 @@
  */
 
 var EQNUM_PANEL_VERSION = "0.2.9";
+var EQNUM_PANEL_BUILD = 12;
 var MAX_LOG_LINES = 1500;
 var g_busy = false;
 var g_progText = "";
@@ -251,6 +252,25 @@ function actionLabel(kind, scope) {
   return kind;
 }
 
+// 读取界面上当前的编号设置，动作执行时传给核心，保证所见即所得
+function uiSettings() {
+  var o = {};
+  var m = $("selMode");
+  if (m) o.mode = (m.value === "continuous") ? "continuous" : "chapter";
+  var l = $("selLevel");
+  if (l) o.level = (l.value === "2") ? 2 : 1;
+  var s = $("inpStart");
+  if (s) {
+    var n = Number(s.value);
+    o.start = (n >= 1) ? n : 1;
+  }
+  var p = $("inpRefPrefix");
+  if (p) o.refPrefix = String(p.value);
+  var r = $("selRefreshRefs");
+  if (r) o.refreshRefs = r.value;
+  return o;
+}
+
 function runAction(kind, scope) {
   if (g_busy) {
     appendLog({ text: "上一个任务还在执行，请稍候", level: "warn" });
@@ -275,11 +295,14 @@ function runAction(kind, scope) {
   setProgress(0, 0, "准备：" + label);
   appendLog({ text: "=== " + label + " 开始 ===", level: "info" });
 
+  // 以界面上的设置为准，避免“设置存到了 A 文档、操作发生在 B 文档”导致模式不一致
+  window.EQNUM_SETTINGS_OVERRIDE = uiSettings();
   window.EQNUM_CANCEL = false;
 
   function finish() {
     appendLog({ text: "=== " + label + " 结束 ===", level: "info" });
     window.EQNUM_CANCEL = false;
+    window.EQNUM_SETTINGS_OVERRIDE = null;
     setBusy(false);
     // 核心没有上报过任何进度时，给一个结束提示，避免一直停在“准备”
     if (/^准备/.test(g_progText)) setProgress(0, 0, "结束：" + label);
@@ -397,7 +420,7 @@ function initGapSetting() {
 }
 
 function init() {
-  $("verText").textContent = "v" + EQNUM_PANEL_VERSION;
+  $("verText").textContent = "v" + EQNUM_PANEL_VERSION + " build " + EQNUM_PANEL_BUILD;
 
   if (window.EQNUM_BUS) {
     for (var i = 0; i < EQNUM_BUS.lines.length; i++) appendLog(EQNUM_BUS.lines[i]);
